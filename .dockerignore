@@ -1,0 +1,10 @@
+.git
+.claude
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+refresh_token.txt
+data/
+dashboard.html

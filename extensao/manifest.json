@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "RA Token Capturer — Next Fit",
+  "version": "1.0",
+  "description": "Captura o refresh_token (offline_access) do login da empresa no Reclame Aqui, pronto pra colar no radar de reclamações.",
+  "permissions": ["storage", "downloads"],
+  "host_permissions": ["https://*.reclameaqui.com.br/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.reclameaqui.com.br/*"],
+      "js": ["content-bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://*.reclameaqui.com.br/*"],
+      "js": ["content-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "RA Token Capturer"
+  }
+}
