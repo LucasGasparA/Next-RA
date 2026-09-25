@@ -784,7 +784,7 @@ CSS = """
   .kebab-btn:hover { color: var(--ink); background: var(--hover-surface); }
 
   .kebab-menu {
-    position: absolute; top: calc(100% + 10px); right: 0; z-index: 30; width: 220px;
+    position: fixed; z-index: 60; width: 220px;
     background: var(--card); border: 1px solid var(--border-strong); border-radius: 16px;
     box-shadow: var(--shadow); padding: 10px; display: flex; flex-direction: column; gap: 4px;
   }
@@ -1029,11 +1029,23 @@ function toggleTheme(){
 }
 applyThemeIcon();
 
+function positionKebabMenu(){
+  var menu = document.getElementById('kebabMenu');
+  var btn = document.getElementById('kebabToggle');
+  if (!menu || !btn) return;
+  var r = btn.getBoundingClientRect();
+  var menuWidth = 220;
+  var right = Math.max(8, window.innerWidth - r.right);
+  if (right + menuWidth > window.innerWidth - 8) right = window.innerWidth - menuWidth - 8;
+  menu.style.top = (r.bottom + 10) + 'px';
+  menu.style.right = right + 'px';
+}
 function toggleKebabMenu(force){
   var menu = document.getElementById('kebabMenu');
   var btn = document.getElementById('kebabToggle');
   if (!menu || !btn) return;
   var show = typeof force === 'boolean' ? force : menu.hidden;
+  if (show) positionKebabMenu();
   menu.hidden = !show;
   btn.setAttribute('aria-expanded', show ? 'true' : 'false');
 }
@@ -1047,6 +1059,8 @@ document.addEventListener('click', function(e){
 document.addEventListener('keydown', function(e){
   if (e.key === 'Escape') toggleKebabMenu(false);
 });
+window.addEventListener('scroll', function(){ toggleKebabMenu(false); }, true);
+window.addEventListener('resize', function(){ toggleKebabMenu(false); });
 
 var RC_PAGE_SIZE = 15;
 var rcPage = 1;
