@@ -1029,6 +1029,16 @@ function toggleTheme(){
 }
 applyThemeIcon();
 
+(function(){
+  // .dock usa backdrop-filter, que cria um "containing block" novo pra
+  // position:fixed em navegadores modernos (mesma regra de transform/filter) —
+  // sem isso o menu ficava preso dentro do dock mesmo com position:fixed.
+  // Movendo o nó pra fora (direto no <body>) ele escapa de qualquer ancestral
+  // com essa propriedade, agora ou no futuro.
+  var menu = document.getElementById('kebabMenu');
+  if (menu && menu.parentNode !== document.body) document.body.appendChild(menu);
+})();
+
 function positionKebabMenu(){
   var menu = document.getElementById('kebabMenu');
   var btn = document.getElementById('kebabToggle');
