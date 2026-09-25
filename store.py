@@ -28,7 +28,12 @@ CREATE TABLE IF NOT EXISTS complaints (
     last_seen TIMESTAMPTZ NOT NULL,
     deactivated_at TIMESTAMPTZ
 );
+ALTER TABLE complaints ADD COLUMN IF NOT EXISTS categoria TEXT;
 CREATE TABLE IF NOT EXISTS tags (
+    name TEXT PRIMARY KEY,
+    position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS categorias (
     name TEXT PRIMARY KEY,
     position INTEGER NOT NULL
 );
@@ -51,7 +56,7 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 # Campos gravados em colunas próprias — o resto do registro vai pra JSONB "data".
-RECORD_COLUMNS = ("id", "tag_origem", "first_seen", "last_seen", "deactivated_at")
+RECORD_COLUMNS = ("id", "tag_origem", "categoria", "first_seen", "last_seen", "deactivated_at")
 
 
 def get_connection() -> psycopg.Connection:
@@ -84,6 +89,7 @@ def load_db(conn: psycopg.Connection) -> dict:
             record = dict(row["data"])
             record["id"] = row["id"]
             record["tag_origem"] = row["tag_origem"]
+            record["categoria"] = row["categoria"]
             record["first_seen"] = _iso(row["first_seen"])
             record["last_seen"] = _iso(row["last_seen"])
             record["deactivated_at"] = _iso(row["deactivated_at"])
@@ -91,6 +97,9 @@ def load_db(conn: psycopg.Connection) -> dict:
 
         cur.execute("SELECT name FROM tags ORDER BY position")
         tags = [r["name"] for r in cur.fetchall()]
+
+        cur.execute("SELECT name FROM categorias ORDER BY position")
+        categorias = [r["name"] for r in cur.fetchall()]
 
         cur.execute("SELECT month_key, sla FROM monthly_overrides")
         monthly_overrides = {r["month_key"]: {"sla": r["sla"]} for r in cur.fetchall()}
@@ -100,6 +109,7 @@ def load_db(conn: psycopg.Connection) -> dict:
 
     db = {
         "tags": tags or list(DEFAULT_TAGS),
+        "categorias": categorias,
         "complaints": complaints,
         "monthly_overrides": monthly_overrides,
     }
@@ -118,11 +128,12 @@ def save_db(conn: psycopg.Connection, db: dict) -> None:
             data = {k: v for k, v in record.items() if k not in RECORD_COLUMNS}
             cur.execute(
                 """
-                INSERT INTO complaints (id, data, tag_origem, first_seen, last_seen, deactivated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO complaints (id, data, tag_origem, categoria, first_seen, last_seen, deactivated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     data = EXCLUDED.data,
                     tag_origem = EXCLUDED.tag_origem,
+                    categoria = EXCLUDED.categoria,
                     first_seen = EXCLUDED.first_seen,
                     last_seen = EXCLUDED.last_seen,
                     deactivated_at = EXCLUDED.deactivated_at
@@ -131,6 +142,7 @@ def save_db(conn: psycopg.Connection, db: dict) -> None:
                     cid,
                     json.dumps(data, ensure_ascii=False),
                     record.get("tag_origem"),
+                    record.get("categoria"),
                     record.get("first_seen"),
                     record.get("last_seen"),
                     record.get("deactivated_at"),
@@ -150,6 +162,20 @@ def save_db(conn: psycopg.Connection, db: dict) -> None:
                 )
                 next_position += 1
                 existing_tags.add(tag)
+
+        cur.execute("SELECT name FROM categorias")
+        existing_categorias = {r["name"] for r in cur.fetchall()}
+        cur.execute("SELECT COALESCE(MAX(position), -1) AS m FROM categorias")
+        next_cat_position = cur.fetchone()["m"] + 1
+        for categoria in db.get("categorias", []):
+            if categoria not in existing_categorias:
+                cur.execute(
+                    "INSERT INTO categorias (name, position) VALUES (%s, %s) "
+                    "ON CONFLICT (name) DO NOTHING",
+                    (categoria, next_cat_position),
+                )
+                next_cat_position += 1
+                existing_categorias.add(categoria)
 
         for month_key, override in db.get("monthly_overrides", {}).items():
             cur.execute(
@@ -200,6 +226,38 @@ def set_tag(conn: psycopg.Connection, cid: str, tag: str | None) -> bool:
     conn.commit()
     if updated and tag:
         add_tag(conn, tag)
+    return updated
+
+
+def list_categorias(conn: psycopg.Connection) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT name FROM categorias ORDER BY position")
+        return [r["name"] for r in cur.fetchall()]
+
+
+def add_categoria(conn: psycopg.Connection, name: str) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM categorias WHERE name = %s", (name,))
+        if cur.fetchone() is None:
+            cur.execute("SELECT COALESCE(MAX(position), -1) AS m FROM categorias")
+            next_position = cur.fetchone()["m"] + 1
+            cur.execute(
+                "INSERT INTO categorias (name, position) VALUES (%s, %s) "
+                "ON CONFLICT (name) DO NOTHING",
+                (name, next_position),
+            )
+    conn.commit()
+    return list_categorias(conn)
+
+
+def set_categoria(conn: psycopg.Connection, cid: str, categoria: str | None) -> bool:
+    """UPDATE pontual numa reclamação — não recarrega/reescreve o dict inteiro."""
+    with conn.cursor() as cur:
+        cur.execute("UPDATE complaints SET categoria = %s WHERE id = %s", (categoria, cid))
+        updated = cur.rowcount > 0
+    conn.commit()
+    if updated and categoria:
+        add_categoria(conn, categoria)
     return updated
 
 

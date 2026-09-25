@@ -271,7 +271,7 @@ def dashboard():
         extra_panel_html = render_ar_trend_panel(ar_history.load_snapshots(conn))
         extra_header_html = (
             '<button type="button" class="link-btn" onclick="openTokenModal()">Trocar token</button>'
-            ' &middot; <a href="/logout">Sair</a>'
+            '<a href="/logout">Sair</a>'
         )
         return main.render_dashboard(
             data,
@@ -322,6 +322,34 @@ def api_tags():
         name = (body.get("name") or "").strip()[:60]
         tags = store.add_tag(conn, name) if name else store.list_tags(conn)
         return jsonify({"ok": True, "tags": tags})
+    finally:
+        conn.close()
+
+
+@app.route("/api/categoria", methods=["POST"])
+def api_categoria():
+    body = request.get_json(silent=True) or {}
+    cid = str(body.get("id", ""))
+    categoria = body.get("categoria") or None
+    conn = store.get_connection()
+    try:
+        if store.set_categoria(conn, cid, categoria):
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "reclamação não encontrada"}), 404
+    finally:
+        conn.close()
+
+
+@app.route("/api/categorias", methods=["GET", "POST"])
+def api_categorias():
+    conn = store.get_connection()
+    try:
+        if request.method == "GET":
+            return jsonify({"categorias": store.list_categorias(conn)})
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()[:60]
+        categorias = store.add_categoria(conn, name) if name else store.list_categorias(conn)
+        return jsonify({"ok": True, "categorias": categorias})
     finally:
         conn.close()
 

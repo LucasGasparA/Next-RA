@@ -76,6 +76,7 @@ OUTPUT_HTML = BASE_DIR / "dashboard.html"
 SAMPLE_FILE = BASE_DIR / "sample_response.json"
 
 DEFAULT_TAGS = ["Suporte Técnico", "CSM", "Aluno", "Comercial", "Produto"]
+DEFAULT_CATEGORIES: list[str] = []
 ANSWERED_INTERACTION_TYPES = {"ANSWER", "FINAL_ANSWER", "REPLY"}
 AR_WINDOW_MONTHS = 6
 
@@ -304,10 +305,16 @@ def load_db() -> dict:
     if DB_FILE.exists():
         db = json.loads(DB_FILE.read_text(encoding="utf-8"))
         db.setdefault("tags", list(DEFAULT_TAGS))
+        db.setdefault("categorias", list(DEFAULT_CATEGORIES))
         db.setdefault("complaints", {})
         db.setdefault("monthly_overrides", {})  # ex: {"2026-06": {"sla": "8 dias e 5 horas"}}
         return db
-    return {"tags": list(DEFAULT_TAGS), "complaints": {}, "monthly_overrides": {}}
+    return {
+        "tags": list(DEFAULT_TAGS),
+        "categorias": list(DEFAULT_CATEGORIES),
+        "complaints": {},
+        "monthly_overrides": {},
+    }
 
 
 def save_db(db: dict) -> None:
@@ -343,6 +350,7 @@ def merge_complaints(db: dict, fetched: list[dict], complete: bool = True) -> di
         record = dict(c)
         record["id"] = cid
         record["tag_origem"] = existing.get("tag_origem")
+        record["categoria"] = existing.get("categoria")
         record["first_seen"] = existing.get("first_seen", now)
         record["last_seen"] = now
         record["deactivated_at"] = None
@@ -518,6 +526,8 @@ def compute_monthly_evolution(db: dict, now: datetime, n_months: int = 7) -> lis
             "month_label": month_label(key),
             "eval_rate": round(100 * stats["n_evaluated"] / len(active), 1) if active else None,
             "sla_manual": overrides.get(key, {}).get("sla"),
+            "origin_counts": dict(Counter(c.get("tag_origem") or "Sem tag" for c in active)),
+            "categoria_counts": dict(Counter(c.get("categoria") or "Sem motivo" for c in active)),
         })
     return rows
 
@@ -639,7 +649,8 @@ def build_dashboard_data(db: dict, now: datetime | None = None) -> dict:
         "status": compute_status_breakdown(db),
         "daily": compute_daily_volume(db),
         "tags": db.get("tags", list(DEFAULT_TAGS)),
-        "recent": sorted(active, key=lambda x: x.get("created", ""), reverse=True)[:15],
+        "categorias": db.get("categorias", list(DEFAULT_CATEGORIES)),
+        "recent": sorted(active, key=lambda x: x.get("created", ""), reverse=True),
     }
 
 
@@ -716,6 +727,19 @@ CSS = """
 
     --shadow: 0 10px 30px rgba(0,0,0,.4);
     --glow: 0 0 0 1px rgba(179,69,247,.16), 0 10px 34px rgba(179,69,247,.16);
+    --hover-surface: rgba(255,255,255,.06); --zebra: rgba(255,255,255,.02);
+    --dock-bg: rgba(28,18,37,.78); --glow-op-1: .16; --glow-op-2: .08;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    /* Paleta clara — mesma marca (violeta/menta), sem depender de "dark" */
+    --ink: #201A29; --ink-soft: #4B3F5E; --ink-dim: #7C7091;
+    --canvas: #F4F1FA; --card: #FFFFFF; --border: rgba(32,20,43,.09); --border-strong: rgba(32,20,43,.18);
+
+    --shadow: 0 10px 26px rgba(32,20,43,.10);
+    --glow: 0 0 0 1px rgba(179,69,247,.12), 0 10px 30px rgba(179,69,247,.10);
+    --hover-surface: rgba(32,20,43,.05); --zebra: rgba(32,20,43,.025);
+    --dock-bg: rgba(255,255,255,.82); --glow-op-1: .10; --glow-op-2: .06;
   }
   * { box-sizing: border-box; }
   body {
@@ -728,32 +752,56 @@ CSS = """
 
   .bg-glow { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
   .bg-glow::before, .bg-glow::after { content: ''; position: absolute; width: 640px; height: 640px; border-radius: 50%; filter: blur(130px); }
-  .bg-glow::before { background: var(--violet-bright); opacity: .16; top: -240px; left: -180px; }
-  .bg-glow::after { background: var(--mint); opacity: .08; bottom: -260px; right: -200px; }
+  .bg-glow::before { background: var(--violet-bright); opacity: var(--glow-op-1); top: -240px; left: -180px; }
+  .bg-glow::after { background: var(--mint); opacity: var(--glow-op-2); bottom: -260px; right: -200px; }
 
   .wordmark { display: flex; align-items: center; gap: 8px; font-family: 'Manrope', sans-serif; font-weight: 800; font-size: 16px; color: var(--ink); }
   .wordmark .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--violet-bright); flex-shrink: 0; box-shadow: 0 0 10px var(--violet-bright); }
 
   .dock-wrap { position: sticky; top: 14px; z-index: 20; display: flex; justify-content: center; padding: 0 16px; margin-bottom: 22px; }
   .dock {
-    display: flex; align-items: center; gap: 20px; background: rgba(28,18,37,.78); backdrop-filter: blur(16px);
+    display: flex; align-items: center; gap: 20px; background: var(--dock-bg); backdrop-filter: blur(16px);
     border: 1px solid var(--border-strong); border-radius: 999px; padding: 8px 8px 8px 20px;
     box-shadow: var(--glow); max-width: 100%; overflow-x: auto;
   }
-  .dock-tabs { display: flex; gap: 2px; }
+  .dock-tabs { display: flex; align-items: center; gap: 2px; }
   .dock-tabs .tab-btn {
     appearance: none; background: none; border: none; cursor: pointer; font: inherit;
-    padding: 8px 15px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--ink-dim); white-space: nowrap;
+    height: 34px; padding: 0 15px; border-radius: 999px; font-size: 13px; font-weight: 600;
+    line-height: 1; color: var(--ink-dim); white-space: nowrap;
+    display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
   }
   .dock-tabs .tab-btn:hover { color: var(--ink); }
   .dock-tabs .tab-btn.active { background: var(--violet-bright); color: #1B0929; }
   .tab-panel[hidden] { display: none; }
-  .dock-actions { display: flex; align-items: center; gap: 12px; padding-right: 4px; }
+  .dock-actions { display: flex; align-items: center; padding-right: 4px; position: relative; }
 
-  .topbar-links { font-size: 12px; }
-  .topbar-links a, .topbar-links .link-btn { color: var(--ink-soft); }
-  .topbar-links a:hover, .topbar-links .link-btn:hover { color: var(--ink); text-decoration: underline; }
-  .link-btn { appearance: none; background: none; border: none; padding: 0; font: inherit; cursor: pointer; text-decoration: none; }
+  .kebab-btn {
+    appearance: none; background: none; border: 1px solid var(--border-strong); cursor: pointer;
+    width: 34px; height: 34px; border-radius: 50%; color: var(--ink-soft); font-size: 17px; font-weight: 700;
+    display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; flex-shrink: 0;
+  }
+  .kebab-btn:hover { color: var(--ink); background: var(--hover-surface); }
+
+  .kebab-menu {
+    position: absolute; top: calc(100% + 10px); right: 0; z-index: 30; width: 220px;
+    background: var(--card); border: 1px solid var(--border-strong); border-radius: 16px;
+    box-shadow: var(--shadow); padding: 10px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .kebab-menu[hidden] { display: none; }
+  .kebab-brand { padding: 4px 8px 8px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+  .kebab-item {
+    appearance: none; background: none; border: none; cursor: pointer; font: inherit; text-align: left;
+    color: var(--ink-soft); font-size: 13px; font-weight: 600; padding: 9px 8px; border-radius: 8px; width: 100%;
+  }
+  .kebab-item:hover { color: var(--ink); background: var(--hover-surface); }
+  .kebab-menu .btn { width: 100%; margin: 2px 0; }
+  .kebab-links { display: flex; flex-direction: column; }
+  .kebab-links a, .kebab-links .link-btn {
+    display: block; color: var(--ink-soft); font-size: 13px; font-weight: 600; padding: 9px 8px; border-radius: 8px; text-decoration: none;
+  }
+  .kebab-links a:hover, .kebab-links .link-btn:hover { color: var(--ink); background: var(--hover-surface); }
+  .link-btn { appearance: none; background: none; border: none; font: inherit; cursor: pointer; text-align: left; }
 
   .wrap { max-width: 1220px; margin: 0 auto; padding: 0 24px 64px; position: relative; }
   .status-line { font-size: 12px; color: var(--ink-dim); margin-bottom: 18px; }
@@ -799,7 +847,7 @@ CSS = """
   .modal-form textarea:focus { outline: 2px solid var(--violet-bright); outline-offset: 1px; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
   .btn-ghost { background: none; color: var(--ink-soft); box-shadow: none; }
-  .btn-ghost:hover { background: rgba(255,255,255,.06); filter: none; }
+  .btn-ghost:hover { background: var(--hover-surface); filter: none; }
 
   .panel { background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 18px 20px 20px; margin-bottom: 18px; box-shadow: var(--shadow); }
   .panel-title { font-size: 14.5px; font-weight: 700; margin: 0 0 3px; color: var(--ink); }
@@ -843,7 +891,7 @@ CSS = """
 
   .toast-wrap { position: fixed; bottom: 20px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
   .toast {
-    background: #241830; color: var(--ink); border: 1px solid var(--border-strong); font-size: 13px; padding: 11px 16px; border-radius: 12px;
+    background: var(--card); color: var(--ink); border: 1px solid var(--border-strong); font-size: 13px; padding: 11px 16px; border-radius: 12px;
     box-shadow: var(--shadow); max-width: 320px; animation: toast-in .18s ease-out;
   }
   .toast--error { background: var(--coral); color: #340708; border-color: transparent; }
@@ -875,7 +923,7 @@ CSS = """
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; font-size: 12px; color: var(--ink); font-weight: 700; padding: 8px 10px; border-bottom: 2px solid var(--border-strong); }
   td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; color: var(--ink-soft); }
-  tbody tr:nth-child(even) { background: rgba(255,255,255,.02); }
+  tbody tr:nth-child(even) { background: var(--zebra); }
   tbody tr:hover { background: var(--violet-pale); }
   tr:last-child td { border-bottom: none; }
   .title-cell { max-width: 340px; color: var(--ink); }
@@ -884,6 +932,70 @@ CSS = """
   .tag-select { background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: inherit; }
   .empty { color: var(--ink-dim); font-size: 13px; }
   footer { margin-top: 8px; font-size: 11px; color: var(--ink-dim); line-height: 1.6; background: var(--card); border: 1px solid var(--border); border-radius: 18px; padding: 14px 18px; box-shadow: var(--shadow); }
+
+  .filter-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+  .filter-bar select, .filter-bar input[type="search"] {
+    background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 8px;
+    padding: 7px 10px; font-size: 12.5px; font-family: inherit;
+  }
+  .filter-bar input[type="search"] { flex: 1; min-width: 160px; }
+  .filter-bar select { min-width: 130px; }
+  .filter-count { font-size: 12px; color: var(--ink-dim); margin: -8px 0 14px; }
+
+  .pagination { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 16px; flex-wrap: wrap; }
+  .pagination button {
+    appearance: none; background: var(--canvas); color: var(--ink-soft); border: 1px solid var(--border-strong);
+    border-radius: 8px; padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; font-family: inherit; min-width: 34px;
+  }
+  .pagination button:hover { color: var(--ink); background: var(--hover-surface); }
+  .pagination button.active { background: var(--violet-bright); color: #1B0929; border-color: transparent; }
+  .pagination button:disabled { opacity: .4; cursor: default; }
+  .pagination .pg-ellipsis { color: var(--ink-dim); font-size: 12px; padding: 0 2px; }
+
+  .manage-tags { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 4px; }
+  @media (max-width: 640px) { .manage-tags { grid-template-columns: 1fr; } }
+  .manage-tags-col p.small-label { font-size: 11.5px; font-weight: 700; color: var(--ink-soft); margin: 0 0 8px; }
+  .manage-tags-form { display: flex; gap: 8px; }
+  .manage-tags-form input[type="text"] {
+    flex: 1; background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 8px;
+    padding: 7px 10px; font-size: 12.5px; font-family: inherit; min-width: 0;
+  }
+  .manage-tags-form button { padding: 7px 14px; font-size: 12.5px; }
+
+  .ra1000-hero { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .ra1000-hero-badge {
+    width: 64px; height: 64px; border-radius: 50%; flex-shrink: 0; font-size: 28px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--violet-pale); filter: grayscale(1) opacity(.7);
+  }
+  .ra1000-hero-badge--ok { background: rgba(61,214,140,.16); filter: none; }
+  .ra1000-hero-value { font-family: 'Manrope', sans-serif; font-weight: 800; font-size: 36px; line-height: 1; color: var(--ink); }
+  .ra1000-hero-label { font-size: 12.5px; color: var(--ink-soft); margin-top: 6px; }
+  .ra1000-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+  .ra1000-card {
+    background: var(--canvas); border: 1px solid var(--border); border-radius: 14px; padding: 16px 12px;
+    display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center;
+  }
+  .ra1000-card--ok { border-color: rgba(61,214,140,.35); background: rgba(61,214,140,.06); }
+  .ra1000-icon {
+    width: 28px; height: 28px; border-radius: 50%; font-size: 14px; font-weight: 800;
+    display: flex; align-items: center; justify-content: center; background: var(--border-strong); color: var(--ink-dim);
+  }
+  .ra1000-icon--ok { background: var(--mint); color: #05230F; }
+  .ra1000-card-value { font-family: 'Manrope', sans-serif; font-weight: 800; font-size: 19px; color: var(--ink); }
+  .ra1000-card-label { font-size: 11.5px; color: var(--ink-soft); line-height: 1.35; }
+
+  .cmp-select-row { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+  .cmp-select-row select {
+    background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 8px;
+    padding: 7px 10px; font-size: 12.5px; font-family: inherit; min-width: 140px;
+  }
+  .cmp-vs { font-size: 12px; color: var(--ink-dim); font-weight: 700; }
+  .cmp-section-title { font-size: 12.5px; font-weight: 700; color: var(--ink-soft); margin: 18px 0 8px; }
+  .cmp-section-title:first-child { margin-top: 0; }
+  .delta-up { color: var(--mint); font-weight: 600; }
+  .delta-down { color: var(--coral); font-weight: 600; }
+  .delta-flat { color: var(--ink-dim); }
 """
 
 TABS_JS = """
@@ -900,6 +1012,195 @@ document.querySelectorAll('.tab-btn').forEach(function(btn){
   var saved = null;
   try { saved = localStorage.getItem('nextRaTab'); } catch (e) {}
   if (saved && document.querySelector('.tab-panel[data-tab="' + saved + '"]')) selectTab(saved);
+})();
+
+function applyThemeIcon(){
+  var label = document.getElementById('themeToggleLabel');
+  if (!label) return;
+  var isLight = document.documentElement.dataset.theme === 'light';
+  label.textContent = isLight ? 'Mudar para tema escuro' : 'Mudar para tema claro';
+}
+function toggleTheme(){
+  var isLight = document.documentElement.dataset.theme === 'light';
+  var next = isLight ? 'dark' : 'light';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem('nextRaTheme', next); } catch (e) {}
+  applyThemeIcon();
+}
+applyThemeIcon();
+
+function toggleKebabMenu(force){
+  var menu = document.getElementById('kebabMenu');
+  var btn = document.getElementById('kebabToggle');
+  if (!menu || !btn) return;
+  var show = typeof force === 'boolean' ? force : menu.hidden;
+  menu.hidden = !show;
+  btn.setAttribute('aria-expanded', show ? 'true' : 'false');
+}
+document.addEventListener('click', function(e){
+  var menu = document.getElementById('kebabMenu');
+  var btn = document.getElementById('kebabToggle');
+  if (!menu || menu.hidden) return;
+  if (menu.contains(e.target) || btn.contains(e.target)) return;
+  toggleKebabMenu(false);
+});
+document.addEventListener('keydown', function(e){
+  if (e.key === 'Escape') toggleKebabMenu(false);
+});
+
+var RC_PAGE_SIZE = 15;
+var rcPage = 1;
+function getComplaintRows(){
+  var tbody = document.getElementById('rcTableBody');
+  return tbody ? Array.prototype.slice.call(tbody.querySelectorAll('tr[data-title]')) : [];
+}
+function applyComplaintFilters(){
+  var titleEl = document.getElementById('rcFilterTitle');
+  var statusEl = document.getElementById('rcFilterStatus');
+  var origemEl = document.getElementById('rcFilterOrigem');
+  var categoriaEl = document.getElementById('rcFilterCategoria');
+  if (!titleEl) return;
+  var titleQ = (titleEl.value || '').toLowerCase().trim();
+  var statusQ = statusEl.value, origemQ = origemEl.value, categoriaQ = categoriaEl.value;
+  var rows = getComplaintRows();
+  var visible = [];
+  rows.forEach(function(tr){
+    var ok = true;
+    if (titleQ && tr.dataset.title.indexOf(titleQ) === -1) ok = false;
+    if (ok && statusQ && tr.dataset.status !== statusQ) ok = false;
+    if (ok && origemQ && tr.dataset.origem !== origemQ) ok = false;
+    if (ok && categoriaQ && tr.dataset.categoria !== categoriaQ) ok = false;
+    if (ok) visible.push(tr);
+  });
+  rcPage = 1;
+  renderComplaintPage(rows, visible);
+}
+function renderComplaintPage(allRows, visibleRows){
+  var totalPages = Math.max(1, Math.ceil(visibleRows.length / RC_PAGE_SIZE));
+  if (rcPage > totalPages) rcPage = totalPages;
+  var start = (rcPage - 1) * RC_PAGE_SIZE, end = start + RC_PAGE_SIZE;
+  var shown = visibleRows.slice(start, end);
+  allRows.forEach(function(tr){ tr.style.display = shown.indexOf(tr) === -1 ? 'none' : ''; });
+  var countEl = document.getElementById('rcFilterCount');
+  if (countEl) {
+    countEl.textContent = visibleRows.length === 0
+      ? 'Nenhuma reclamação encontrada com esses filtros.'
+      : visibleRows.length + ' reclamação(ões) · página ' + rcPage + ' de ' + totalPages;
+  }
+  renderPagination(allRows, visibleRows, totalPages);
+}
+function renderPagination(allRows, visibleRows, totalPages){
+  var wrap = document.getElementById('rcPagination');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (totalPages <= 1) return;
+  function addBtn(label, page, opts){
+    opts = opts || {};
+    var b = document.createElement('button');
+    b.type = 'button'; b.textContent = label;
+    if (opts.active) b.classList.add('active');
+    if (opts.disabled) b.disabled = true;
+    b.addEventListener('click', function(){ rcPage = page; renderComplaintPage(allRows, visibleRows); });
+    wrap.appendChild(b);
+  }
+  addBtn('‹', Math.max(1, rcPage - 1), {disabled: rcPage === 1});
+  var maxButtons = 7;
+  var startP = Math.max(1, rcPage - 3);
+  var endP = Math.min(totalPages, startP + maxButtons - 1);
+  startP = Math.max(1, endP - maxButtons + 1);
+  if (startP > 1) {
+    addBtn('1', 1);
+    if (startP > 2) { var e = document.createElement('span'); e.className = 'pg-ellipsis'; e.textContent = '…'; wrap.appendChild(e); }
+  }
+  for (var p = startP; p <= endP; p++) addBtn(String(p), p, {active: p === rcPage});
+  if (endP < totalPages) {
+    if (endP < totalPages - 1) { var e2 = document.createElement('span'); e2.className = 'pg-ellipsis'; e2.textContent = '…'; wrap.appendChild(e2); }
+    addBtn(String(totalPages), totalPages);
+  }
+  addBtn('›', Math.min(totalPages, rcPage + 1), {disabled: rcPage === totalPages});
+}
+if (document.getElementById('rcTableBody')) applyComplaintFilters();
+
+function escHtml(s){
+  var d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
+function cmpFmtVal(v, decimals, suffix){
+  suffix = suffix || '';
+  return (v === null || v === undefined) ? '—' : v.toFixed(decimals) + suffix;
+}
+function cmpDeltaHtml(a, b, opts){
+  opts = opts || {};
+  var decimals = opts.decimals === undefined ? 2 : opts.decimals;
+  var suffix = opts.suffix || '';
+  if (a === null || a === undefined || b === null || b === undefined) return '<span class="delta-flat">—</span>';
+  var d = Number((b - a).toFixed(decimals));
+  if (Math.abs(d) < Math.pow(10, -decimals) / 2) return '<span class="delta-flat">sem variação</span>';
+  var up = d > 0;
+  var good = opts.higherIsBetter === false ? !up : up;
+  var cls = good ? 'delta-up' : 'delta-down';
+  var arrow = up ? '▲' : '▼';
+  var sign = up ? '+' : '';
+  return '<span class="' + cls + '">' + arrow + ' ' + sign + d.toFixed(decimals) + suffix + '</span>';
+}
+function cmpBreakdownRows(dictA, dictB){
+  dictA = dictA || {}; dictB = dictB || {};
+  var keys = {};
+  Object.keys(dictA).forEach(function(k){ keys[k] = true; });
+  Object.keys(dictB).forEach(function(k){ keys[k] = true; });
+  var names = Object.keys(keys).sort(function(x, y){
+    return ((dictB[y] || 0) + (dictA[y] || 0)) - ((dictB[x] || 0) + (dictA[x] || 0));
+  });
+  if (!names.length) return '<tr><td colspan="4" class="empty">Sem dados.</td></tr>';
+  return names.map(function(name){
+    var va = dictA[name] || 0, vb = dictB[name] || 0;
+    return '<tr><td>' + escHtml(name) + '</td><td class="mono">' + va + '</td><td class="mono">' + vb + '</td><td>' +
+      cmpDeltaHtml(va, vb, {decimals: 0, higherIsBetter: false}) + '</td></tr>';
+  }).join('');
+}
+function renderMonthComparison(){
+  var dataEl = document.getElementById('monthlyCompareData');
+  var resultEl = document.getElementById('cmpResult');
+  var selA = document.getElementById('cmpMonthA');
+  var selB = document.getElementById('cmpMonthB');
+  if (!dataEl || !resultEl || !selA || !selB) return;
+  var months;
+  try { months = JSON.parse(dataEl.textContent); } catch (e) { return; }
+  var a = months.filter(function(m){ return m.key === selA.value; })[0];
+  var b = months.filter(function(m){ return m.key === selB.value; })[0];
+  if (!a || !b) { resultEl.innerHTML = '<p class="empty">Selecione dois meses.</p>'; return; }
+
+  var kpiRows = [
+    {label: 'Reclamações', a: a.total, b: b.total, decimals: 0, higherIsBetter: false},
+    {label: 'AR', a: a.ar, b: b.ar, decimals: 2, higherIsBetter: true},
+    {label: 'Nota média (MA)', a: a.ma, b: b.ma, decimals: 2, higherIsBetter: true},
+    {label: 'Índice de resposta (IR)', a: a.ir, b: b.ir, decimals: 1, suffix: '%', higherIsBetter: true},
+    {label: 'Solução (IS)', a: a.is_pct, b: b.is_pct, decimals: 1, suffix: '%', higherIsBetter: true},
+    {label: 'Voltaria (IN)', a: a.in_pct, b: b.in_pct, decimals: 1, suffix: '%', higherIsBetter: true}
+  ];
+  var kpiHtml = kpiRows.map(function(r){
+    return '<tr><td>' + r.label + '</td>' +
+      '<td class="mono">' + cmpFmtVal(r.a, r.decimals, r.suffix) + '</td>' +
+      '<td class="mono">' + cmpFmtVal(r.b, r.decimals, r.suffix) + '</td>' +
+      '<td>' + cmpDeltaHtml(r.a, r.b, {decimals: r.decimals, suffix: r.suffix, higherIsBetter: r.higherIsBetter}) + '</td></tr>';
+  }).join('');
+
+  var labelA = escHtml(a.label), labelB = escHtml(b.label);
+  resultEl.innerHTML =
+    '<p class="cmp-section-title">KPIs</p>' +
+    '<table><thead><tr><th></th><th>' + labelA + '</th><th>' + labelB + '</th><th>Variação</th></tr></thead><tbody>' + kpiHtml + '</tbody></table>' +
+    '<p class="cmp-section-title">Origem</p>' +
+    '<table><thead><tr><th>Origem</th><th>' + labelA + '</th><th>' + labelB + '</th><th>Variação</th></tr></thead><tbody>' + cmpBreakdownRows(a.origin, b.origin) + '</tbody></table>' +
+    '<p class="cmp-section-title">Motivo</p>' +
+    '<table><thead><tr><th>Motivo</th><th>' + labelA + '</th><th>' + labelB + '</th><th>Variação</th></tr></thead><tbody>' + cmpBreakdownRows(a.categoria, b.categoria) + '</tbody></table>';
+}
+(function(){
+  var selA = document.getElementById('cmpMonthA'), selB = document.getElementById('cmpMonthB');
+  if (!selA || !selB) return;
+  selA.addEventListener('change', renderMonthComparison);
+  selB.addEventListener('change', renderMonthComparison);
+  renderMonthComparison();
 })();
 </script>
 """
@@ -1022,6 +1323,64 @@ async function setTag(id, select){
     showToast('Erro ao salvar tag: ' + e, 'error');
   }
 }
+async function setCategoria(id, select){
+  const categoria = select.value || null;
+  try {
+    const r = await fetch('/api/categoria', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, categoria})
+    });
+    const j = await r.json();
+    if (j.ok) { showToast(categoria ? 'Motivo salvo: ' + categoria : 'Motivo removido', 'ok'); }
+    else { showToast('Erro ao salvar motivo: ' + (j.error || 'desconhecido'), 'error'); }
+  } catch (e) {
+    showToast('Erro ao salvar motivo: ' + e, 'error');
+  }
+}
+function appendSelectOptions(kind, names){
+  var handlerPrefix = kind === 'origem' ? 'setTag(' : 'setCategoria(';
+  var filterSelect = document.getElementById(kind === 'origem' ? 'rcFilterOrigem' : 'rcFilterCategoria');
+  function addMissing(selectEl){
+    var existing = {};
+    Array.prototype.forEach.call(selectEl.options, function(o){ existing[o.value] = true; });
+    names.forEach(function(n){
+      if (!existing[n]) {
+        var o = document.createElement('option'); o.value = n; o.textContent = n; selectEl.appendChild(o);
+      }
+    });
+  }
+  if (filterSelect) addMissing(filterSelect);
+  document.querySelectorAll('#rcTableBody select.tag-select').forEach(function(sel){
+    var onchange = sel.getAttribute('onchange') || '';
+    if (onchange.indexOf(handlerPrefix) === 0) addMissing(sel);
+  });
+}
+async function addTagOption(evt, kind){
+  evt.preventDefault();
+  var input = document.getElementById(kind === 'origem' ? 'newOrigemInput' : 'newCategoriaInput');
+  var name = (input.value || '').trim();
+  if (!name) return false;
+  var endpoint = kind === 'origem' ? '/api/tags' : '/api/categorias';
+  try {
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const j = await r.json();
+    if (j.ok) {
+      appendSelectOptions(kind, kind === 'origem' ? j.tags : j.categorias);
+      input.value = '';
+      showToast((kind === 'origem' ? 'Origem' : 'Motivo') + ' criado(a): ' + name, 'ok');
+    } else {
+      showToast('Erro ao criar: ' + (j.error || 'desconhecido'), 'error');
+    }
+  } catch (e) {
+    showToast('Erro ao criar: ' + e, 'error');
+  }
+  return false;
+}
 </script>
 """
 
@@ -1107,6 +1466,36 @@ def render_dashboard(
             f"<td class='mono'>{sla}</td></tr>"
         )
     monthly_html = "\n".join(monthly_rows)
+
+    # --- payload pro comparativo de meses (client-side, sem round-trip) ---
+    monthly_compare_payload = [
+        {
+            "key": row["month_key"],
+            "label": row["month_label"],
+            "total": row["active"],
+            "ar": row["ar"],
+            "ma": row["ma"],
+            "ir": row["ir"],
+            "is_pct": row["is_pct"],
+            "in_pct": row["in_pct"],
+            "origin": row["origin_counts"],
+            "categoria": row["categoria_counts"],
+        }
+        for row in monthly
+    ]
+    monthly_compare_json = json.dumps(monthly_compare_payload, ensure_ascii=False).replace("</", "<\\/")
+
+    def month_options(selected_key: str) -> str:
+        return "".join(
+            f'<option value="{esc(row["month_key"])}"{" selected" if row["month_key"] == selected_key else ""}>'
+            f'{esc(row["month_label"])}</option>'
+            for row in monthly
+        )
+
+    cmp_default_b = monthly[-1]["month_key"] if monthly else ""
+    cmp_default_a = monthly[-2]["month_key"] if len(monthly) >= 2 else cmp_default_b
+    monthly_opts_a = month_options(cmp_default_a)
+    monthly_opts_b = month_options(cmp_default_b)
 
     # --- projeção (virada de mês) ---
     def delta_html(cur, new, suffix="", higher_is_better=True):
@@ -1196,20 +1585,18 @@ def render_dashboard(
     </div>
     <p class="panel-note" style="margin:0 0 16px">&#128161; {esc(turnover_insight)}</p>"""
 
-    # --- tabela reclamações recentes (com tag) ---
-    def build_tag_select(cid: str, current_tag: str) -> str:
+    # --- tabela de reclamações (com tag de origem e motivo/categoria) ---
+    def build_select(cid: str, current: str, options: list[str], empty_label: str, css_class: str, handler: str) -> str:
         # antes isso era montado com um .replace() em cima da string de options
         # pra injetar o "selected" — quebrava se o nome de uma tag fosse prefixo
         # de outra ("CSM" x "CSM Pleno") e agora quebraria de vez com o escaping.
-        opts = [
-            f'<option value=""{" selected" if not current_tag else ""}>Sem tag</option>'
-        ]
-        for t in data["tags"]:
-            sel = " selected" if t == current_tag else ""
+        opts = [f'<option value=""{" selected" if not current else ""}>{esc(empty_label)}</option>']
+        for t in options:
+            sel = " selected" if t == current else ""
             opts.append(f'<option value="{esc(t)}"{sel}>{esc(t)}</option>')
         cid_js = json.dumps(str(cid))  # id seguro pra dentro do onchange
         return (
-            f'<select class="tag-select" onchange="setTag({esc(cid_js)}, this)">'
+            f'<select class="{css_class}" onchange="{handler}({esc(cid_js)}, this)">'
             f'{"".join(opts)}</select>'
         )
 
@@ -1220,31 +1607,47 @@ def render_dashboard(
             created_fmt = datetime.fromisoformat(created).strftime("%d/%m/%Y %H:%M")
         except ValueError:
             created_fmt = created
-        status = c.get("status", "—")
+        status = c.get("status") or "DESCONHECIDO"
         status_label = STATUS_LABELS.get(status, status)
         status_color = STATUS_COLORS.get(status, "#605E5C")
         score = c.get("score")
         score_html = f'<span style="color:{score_color(score)}">{score:.1f}</span>' if score is not None else "—"
         city = c.get("userCity") or "—"
         state = c.get("userState") or ""
-        title = (c.get("title") or "").strip()
+        title_full = (c.get("title") or "").strip()
+        title = title_full
         if len(title) > 60:
             title = title[:57] + "…"
         cid = c.get("id")
         current_tag = c.get("tag_origem") or ""
+        current_categoria = c.get("categoria") or ""
         if interactive:
-            tag_cell = build_tag_select(cid, current_tag)
+            tag_cell = build_select(cid, current_tag, data["tags"], "Sem tag", "tag-select", "setTag")
+            categoria_cell = build_select(cid, current_categoria, data["categorias"], "Sem motivo", "tag-select", "setCategoria")
         else:
             tag_cell = esc(current_tag) or '<span style="color:var(--ink-dim)">—</span>'
+            categoria_cell = esc(current_categoria) or '<span style="color:var(--ink-dim)">—</span>'
+        row_attrs = (
+            f' data-status="{esc(status)}" data-origem="{esc(current_tag)}"'
+            f' data-categoria="{esc(current_categoria)}" data-title="{esc(title_full.lower())}"'
+        )
         table_rows.append(
-            f"<tr><td class='title-cell'>{esc(title)}</td>"
+            f"<tr{row_attrs}><td class='title-cell'>{esc(title)}</td>"
             f"<td>{esc(city)}{'/' + esc(state) if state else ''}</td>"
             f"<td class='mono'>{esc(created_fmt)}</td>"
             f"<td><span class='pill' style='background:{status_color}22;color:{status_color}'>{esc(status_label)}</span></td>"
             f"<td class='mono score-cell'>{score_html}</td>"
-            f"<td>{tag_cell}</td></tr>"
+            f"<td>{tag_cell}</td>"
+            f"<td>{categoria_cell}</td></tr>"
         )
-    table_html = "\n".join(table_rows) or '<tr><td colspan="6" class="empty">Nenhuma reclamação ativa.</td></tr>'
+    table_html = "\n".join(table_rows) or '<tr><td colspan="7" class="empty">Nenhuma reclamação ativa.</td></tr>'
+
+    status_filter_opts = "".join(
+        f'<option value="{esc(s)}">{esc(STATUS_LABELS.get(s, s))}</option>'
+        for s in sorted(data["status"].keys())
+    )
+    origem_filter_opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in data["tags"])
+    categoria_filter_opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in data["categorias"])
 
     updated_str = data["updated_at"].strftime("%d/%m/%Y às %H:%M")
     stale_hours = (datetime.now() - data["updated_at"]).total_seconds() / 3600
@@ -1259,19 +1662,26 @@ def render_dashboard(
         f'<span class="pill" style="background:{ar["label_color"]}22;color:{ar["label_color"]}">{esc(ar["label"])}</span>'
     )
 
-    ra1000_rows = []
+    ra1000_cards = []
     for crit in ar["ra1000"]["criteria"]:
-        mark = "✅" if crit["ok"] else "—"
-        color = "var(--mint)" if crit["ok"] else "var(--ink-dim)"
-        ra1000_rows.append(
-            f'<div class="status-row-top" style="margin-bottom:8px">'
-            f'<span style="color:{color}">{mark}</span><span>{esc(crit["label"])}</span>'
-            f'<span class="status-count mono">{esc(crit["value"])}</span></div>'
+        ok = crit["ok"]
+        icon = '<span class="ra1000-icon ra1000-icon--ok">✓</span>' if ok else '<span class="ra1000-icon ra1000-icon--pending">–</span>'
+        ra1000_cards.append(
+            f'<div class="ra1000-card{" ra1000-card--ok" if ok else ""}">'
+            f'{icon}<div class="ra1000-card-value">{esc(crit["value"])}</div>'
+            f'<div class="ra1000-card-label">{esc(crit["label"])}</div></div>'
         )
-    ra1000_html = "\n".join(ra1000_rows)
+    ra1000_html = "\n".join(ra1000_cards)
+    ra1000_met, ra1000_total = ar["ra1000"]["met"], ar["ra1000"]["total"]
+    ra1000_eligible = ar["ra1000"]["eligible_numerically"]
+    ra1000_pill_html = (
+        '<span class="pill" style="background:var(--mint);color:#05230F">Elegível numericamente</span>'
+        if ra1000_eligible else
+        '<span class="pill" style="background:var(--border-strong);color:var(--ink-soft)">Ainda não elegível</span>'
+    )
     ra1000_summary = (
-        f'{ar["ra1000"]["met"]}/{ar["ra1000"]["total"]} critérios numéricos batem'
-        + (" · elegível ao RA1000 (falta auditoria/cadastro do RA)" if ar["ra1000"]["eligible_numerically"] else "")
+        f'{ra1000_met}/{ra1000_total} critérios numéricos batem'
+        + (" · elegível ao RA1000 (falta auditoria/cadastro do RA)" if ra1000_eligible else "")
     )
 
     refresh_button = (
@@ -1279,6 +1689,27 @@ def render_dashboard(
         if interactive else ""
     )
     token_modal_html = TOKEN_MODAL_HTML if interactive else ""
+    manage_tags_html = f"""
+  <div class="panel">
+    <p class="panel-title">Gerenciar origens e categorias</p>
+    <p class="panel-note">Cria novas opções pros seletores de Origem e Motivo acima.</p>
+    <div class="manage-tags">
+      <div class="manage-tags-col">
+        <p class="small-label">Nova origem</p>
+        <form class="manage-tags-form" onsubmit="return addTagOption(event, 'origem')">
+          <input type="text" id="newOrigemInput" placeholder="Ex.: Financeiro" maxlength="60">
+          <button type="submit" class="btn btn-ghost">Adicionar</button>
+        </form>
+      </div>
+      <div class="manage-tags-col">
+        <p class="small-label">Novo motivo</p>
+        <form class="manage-tags-form" onsubmit="return addTagOption(event, 'categoria')">
+          <input type="text" id="newCategoriaInput" placeholder="Ex.: Cobrança indevida" maxlength="60">
+          <button type="submit" class="btn btn-ghost">Adicionar</button>
+        </form>
+      </div>
+    </div>
+  </div>""" if interactive else ""
     script = TABS_JS + (SCRIPT_JS if interactive else "")
 
     return f"""<!DOCTYPE html>
@@ -1291,6 +1722,14 @@ def render_dashboard(
 <style>
 {CSS}
 </style>
+<script>
+(function(){{
+  try {{
+    var saved = localStorage.getItem('nextRaTheme');
+    if (saved === 'light' || saved === 'dark') document.documentElement.dataset.theme = saved;
+  }} catch (e) {{}}
+}})();
+</script>
 </head>
 <body>
 
@@ -1298,17 +1737,21 @@ def render_dashboard(
 
 <div class="dock-wrap">
   <nav class="dock">
-    <span class="wordmark"><span class="dot"></span>Next RA</span>
     <div class="dock-tabs">
       <button type="button" class="tab-btn active" data-tab="geral">Visão geral</button>
       <button type="button" class="tab-btn" data-tab="mensal">Evolução mensal</button>
       <button type="button" class="tab-btn" data-tab="volume">Volume &amp; canais</button>
-      <button type="button" class="tab-btn" data-tab="origem">Origem</button>
       <button type="button" class="tab-btn" data-tab="reclamacoes">Reclamações</button>
+      <button type="button" class="tab-btn" data-tab="ra1000">RA1000</button>
     </div>
     <div class="dock-actions">
-      {refresh_button}
-      <div class="topbar-links">{extra_header_html}</div>
+      <button type="button" class="kebab-btn" id="kebabToggle" onclick="toggleKebabMenu()" title="Mais opções" aria-label="Mais opções" aria-haspopup="true" aria-expanded="false">&#8942;</button>
+      <div class="kebab-menu" id="kebabMenu" hidden>
+        <div class="kebab-brand"><span class="wordmark"><span class="dot"></span>Next RA</span></div>
+        <button type="button" class="kebab-item" onclick="toggleTheme()"><span id="themeToggleLabel">Mudar para tema claro</span></button>
+        {refresh_button}
+        <div class="kebab-links">{extra_header_html}</div>
+      </div>
     </div>
   </nav>
 </div>
@@ -1344,12 +1787,6 @@ def render_dashboard(
   </div>
 
   <div class="tab-panel" data-tab="geral">
-
-  <div class="panel">
-    <p class="panel-title">Critérios do Selo RA1000</p>
-    <p class="panel-note">{ra1000_summary} · calculado na mesma janela de 6 meses do AR (blog.reclameaqui.com.br/selo-ra1000)</p>
-    {ra1000_html}
-  </div>
 
   <div class="panel">
     <p class="panel-title">Projeção — virada de mês</p>
@@ -1410,6 +1847,18 @@ def render_dashboard(
     </table>
   </div>
 
+  <div class="panel">
+    <p class="panel-title">Comparar dois meses</p>
+    <p class="panel-note">KPIs, origem e motivo lado a lado &mdash; o que subiu e o que caiu de um mês pro outro.</p>
+    <div class="cmp-select-row">
+      <select id="cmpMonthA">{monthly_opts_a}</select>
+      <span class="cmp-vs">vs</span>
+      <select id="cmpMonthB">{monthly_opts_b}</select>
+    </div>
+    <div id="cmpResult"></div>
+  </div>
+  <script type="application/json" id="monthlyCompareData">{monthly_compare_json}</script>
+
   </div>
 
   <div class="tab-panel" data-tab="volume" hidden>
@@ -1437,12 +1886,26 @@ def render_dashboard(
 
   </div>
 
-  <div class="tab-panel" data-tab="origem" hidden>
+  <div class="tab-panel" data-tab="ra1000" hidden>
 
   <div class="panel">
-    <p class="panel-title">Origem interna</p>
-    <p class="panel-note">Tags atribuídas manualmente (Suporte Técnico, CSM, Aluno, Comercial, Produto...)</p>
-    {origin_html}
+    <div class="ra1000-hero">
+      <div class="ra1000-hero-badge{' ra1000-hero-badge--ok' if ra1000_eligible else ''}">🏆</div>
+      <div>
+        <div class="ra1000-hero-value">{ra1000_met}/{ra1000_total}</div>
+        <div class="ra1000-hero-label">critérios do Selo RA1000 batendo</div>
+        <div style="margin-top:8px">{ra1000_pill_html}</div>
+      </div>
+    </div>
+    <p class="panel-note" style="margin:16px 0 0">calculado na mesma janela de 6 meses do AR (blog.reclameaqui.com.br/selo-ra1000) · falta auditoria e cadastro pelo próprio Reclame Aqui pra confirmar o selo</p>
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Critérios</p>
+    <p class="panel-note">{esc(ra1000_summary)}</p>
+    <div class="ra1000-grid">
+      {ra1000_html}
+    </div>
   </div>
 
   </div>
@@ -1450,15 +1913,42 @@ def render_dashboard(
   <div class="tab-panel" data-tab="reclamacoes" hidden>
 
   <div class="panel">
-    <p class="panel-title">Reclamações recentes</p>
-    <p class="panel-note">15 mais recentes (ativas){' · clique na tag pra classificar a origem' if interactive else ''}</p>
-    <table>
-      <thead><tr><th>Título</th><th>Cidade/UF</th><th>Criada em</th><th>Status</th><th>Nota</th><th>Origem</th></tr></thead>
-      <tbody>
+    <p class="panel-title">Origem interna</p>
+    <p class="panel-note">Tags atribuídas manualmente (Suporte Técnico, CSM, Aluno, Comercial, Produto...)</p>
+    {origin_html}
+  </div>
+
+  <div class="panel">
+    <p class="panel-title">Reclamações</p>
+    <p class="panel-note">Todas as ativas{' · clique numa tag pra classificar origem/motivo' if interactive else ''}</p>
+
+    <div class="filter-bar">
+      <input type="search" id="rcFilterTitle" placeholder="Buscar por título…" oninput="applyComplaintFilters()">
+      <select id="rcFilterStatus" onchange="applyComplaintFilters()">
+        <option value="">Todos os status</option>
+        {status_filter_opts}
+      </select>
+      <select id="rcFilterOrigem" onchange="applyComplaintFilters()">
+        <option value="">Toda origem</option>
+        {origem_filter_opts}
+      </select>
+      <select id="rcFilterCategoria" onchange="applyComplaintFilters()">
+        <option value="">Todo motivo</option>
+        {categoria_filter_opts}
+      </select>
+    </div>
+    <p class="filter-count" id="rcFilterCount"></p>
+
+    <table id="rcTable">
+      <thead><tr><th>Título</th><th>Cidade/UF</th><th>Criada em</th><th>Status</th><th>Nota</th><th>Origem</th><th>Motivo</th></tr></thead>
+      <tbody id="rcTableBody">
         {table_html}
       </tbody>
     </table>
+    <div class="pagination" id="rcPagination"></div>
   </div>
+
+  {manage_tags_html}
 
   </div>
 
