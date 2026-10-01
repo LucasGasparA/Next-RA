@@ -240,9 +240,15 @@ def render_ar_trend_panel(snapshots: list[dict]) -> str:
         circles = []
         for i, s in enumerate(usable):
             tip = f"{s['date']} · AR {s['ar']:.2f} · {s['label']}"
+            cx, cy = f"{x(i):.1f}", f"{y(s['ar']):.1f}"
+            # círculo visível pequeno + um invisível maior por cima só pra
+            # facilitar acertar o hover (o visível sozinho era pequeno demais
+            # pro cursor acertar com precisão num gráfico escalado por %)
             circles.append(
-                f'<circle cx="{x(i):.1f}" cy="{y(s["ar"]):.1f}" r="3.5" '
-                f'fill="{main.score_color(s["ar"])}"><title>{main.esc(tip)}</title></circle>'
+                f'<circle cx="{cx}" cy="{cy}" r="3.5" fill="{main.score_color(s["ar"])}" '
+                f'style="pointer-events:none"></circle>'
+                f'<circle class="chart-point" cx="{cx}" cy="{cy}" r="9" fill="transparent" '
+                f'style="cursor:pointer" data-tip="{main.esc(tip)}"></circle>'
             )
         body = f"""
         <svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet" style="width:100%;height:auto;display:block">
@@ -298,14 +304,41 @@ def api_refresh():
         conn.close()
 
 
+def _rename_list_item(rename_fn, propagate_field: str | None, old: str, new: str):
+    if not new:
+        return jsonify({"ok": False, "error": "Nome novo é obrigatório."}), 400
+    conn = store.get_connection()
+    try:
+        if not rename_fn(conn, old, new):
+            return jsonify({"ok": False, "error": "Já existe um item com esse nome."}), 400
+        if propagate_field:
+            store.propagate_rename(conn, propagate_field, old, new)
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+def _delete_list_item(delete_fn, usage_field: str | None, name: str):
+    conn = store.get_connection()
+    try:
+        used = store.count_usage(conn, usage_field, name) if usage_field else 0
+        if used > 0:
+            return jsonify({"ok": False, "error": f"{used} reclamação(ões) usam isso — reatribua antes de excluir."}), 400
+        delete_fn(conn, name)
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
 @app.route("/api/tag", methods=["POST"])
 def api_tag():
     body = request.get_json(silent=True) or {}
     cid = str(body.get("id", ""))
-    tag = body.get("tag") or None
+    tags_raw = body.get("tags")
+    tags = [str(t).strip()[:60] for t in tags_raw if t] if isinstance(tags_raw, list) else []
     conn = store.get_connection()
     try:
-        if store.set_tag(conn, cid, tag):
+        if store.set_origins(conn, cid, tags):
             return jsonify({"ok": True})
         return jsonify({"ok": False, "error": "reclamação não encontrada"}), 404
     finally:
@@ -324,6 +357,18 @@ def api_tags():
         return jsonify({"ok": True, "tags": tags})
     finally:
         conn.close()
+
+
+@app.route("/api/tags/rename", methods=["POST"])
+def api_tags_rename():
+    body = request.get_json(silent=True) or {}
+    return _rename_list_item(store.rename_tag, "tag_origem", (body.get("old") or "").strip(), (body.get("new") or "").strip()[:60])
+
+
+@app.route("/api/tags/delete", methods=["POST"])
+def api_tags_delete():
+    body = request.get_json(silent=True) or {}
+    return _delete_list_item(store.delete_tag, "tag_origem", (body.get("name") or "").strip())
 
 
 @app.route("/api/categoria", methods=["POST"])
@@ -354,15 +399,102 @@ def api_categorias():
         conn.close()
 
 
+@app.route("/api/categorias/rename", methods=["POST"])
+def api_categorias_rename():
+    body = request.get_json(silent=True) or {}
+    return _rename_list_item(store.rename_categoria, "categoria", (body.get("old") or "").strip(), (body.get("new") or "").strip()[:60])
+
+
+@app.route("/api/categorias/delete", methods=["POST"])
+def api_categorias_delete():
+    body = request.get_json(silent=True) or {}
+    return _delete_list_item(store.delete_categoria, "categoria", (body.get("name") or "").strip())
+
+
+@app.route("/api/responsavel", methods=["POST"])
+def api_responsavel():
+    body = request.get_json(silent=True) or {}
+    cid = str(body.get("id", ""))
+    responsavel = body.get("responsavel") or None
+    conn = store.get_connection()
+    try:
+        if store.set_responsavel(conn, cid, responsavel):
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "reclamação não encontrada"}), 404
+    finally:
+        conn.close()
+
+
+@app.route("/api/responsaveis", methods=["GET", "POST"])
+def api_responsaveis():
+    conn = store.get_connection()
+    try:
+        if request.method == "GET":
+            return jsonify({"responsaveis": store.list_responsaveis(conn)})
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()[:60]
+        responsaveis = store.add_responsavel(conn, name) if name else store.list_responsaveis(conn)
+        return jsonify({"ok": True, "responsaveis": responsaveis})
+    finally:
+        conn.close()
+
+
+@app.route("/api/responsaveis/rename", methods=["POST"])
+def api_responsaveis_rename():
+    body = request.get_json(silent=True) or {}
+    return _rename_list_item(store.rename_responsavel, "responsavel", (body.get("old") or "").strip(), (body.get("new") or "").strip()[:60])
+
+
+@app.route("/api/responsaveis/delete", methods=["POST"])
+def api_responsaveis_delete():
+    body = request.get_json(silent=True) or {}
+    return _delete_list_item(store.delete_responsavel, "responsavel", (body.get("name") or "").strip())
+
+
+@app.route("/api/statuses", methods=["GET", "POST"])
+def api_statuses():
+    conn = store.get_connection()
+    try:
+        if request.method == "GET":
+            return jsonify({"statuses": store.list_custom_statuses(conn)})
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()[:60]
+        if name in main.STATUS_LABELS.values():
+            return jsonify({"ok": False, "error": "Esse nome já é um status nativo da API."}), 400
+        statuses = store.add_custom_status(conn, name) if name else store.list_custom_statuses(conn)
+        return jsonify({"ok": True, "statuses": statuses})
+    finally:
+        conn.close()
+
+
+@app.route("/api/statuses/rename", methods=["POST"])
+def api_statuses_rename():
+    body = request.get_json(silent=True) or {}
+    old, new = (body.get("old") or "").strip(), (body.get("new") or "").strip()[:60]
+    if old in main.STATUS_LABELS.values():
+        return jsonify({"ok": False, "error": "Status nativo não pode ser renomeado."}), 400
+    return _rename_list_item(store.rename_custom_status, "status", old, new)
+
+
+@app.route("/api/statuses/delete", methods=["POST"])
+def api_statuses_delete():
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if name in main.STATUS_LABELS.values():
+        return jsonify({"ok": False, "error": "Status nativo não pode ser excluído."}), 400
+    return _delete_list_item(store.delete_custom_status, "status", name)
+
+
 @app.route("/api/complaints/manual", methods=["POST"])
 def api_complaints_manual():
     body = request.get_json(silent=True) or {}
-    try:
-        record = main.build_manual_complaint(body)
-    except main.ManualComplaintError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
     conn = store.get_connection()
     try:
+        known_statuses = set(main.STATUS_LABELS) | {s["name"] for s in store.list_custom_statuses(conn)}
+        try:
+            record = main.build_manual_complaint(body, known_statuses)
+        except main.ManualComplaintError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         store.insert_manual_complaint(conn, record)
         return jsonify({"ok": True})
     finally:
@@ -377,6 +509,7 @@ def export_complaints():
     status = (request.args.get("status") or "").strip() or None
     origem = (request.args.get("origem") or "").strip() or None
     categoria = (request.args.get("categoria") or "").strip() or None
+    responsavel = (request.args.get("responsavel") or "").strip() or None
 
     conn = store.get_connection()
     try:
@@ -385,18 +518,19 @@ def export_complaints():
     finally:
         conn.close()
 
-    rows = main.filter_complaints_for_export(db, start, end, status, origem, categoria)
+    rows = main.filter_complaints_for_export(db, start, end, status, origem, categoria, responsavel)
+    status_labels = main.combined_status_labels(db.get("custom_statuses", []))
     filename_period = f"{start or 'inicio'}_a_{end or 'fim'}"
 
     if fmt == "csv":
-        body = main.generate_complaints_csv(rows)
+        body = main.generate_complaints_csv(rows, status_labels)
         return Response(
             body,
             mimetype="text/csv",
             headers={"Content-Disposition": f'attachment; filename="reclamacoes_{filename_period}.csv"'},
         )
 
-    body = main.generate_complaints_pdf(rows, start, end)
+    body = main.generate_complaints_pdf(rows, start, end, status_labels)
     return Response(
         body,
         mimetype="application/pdf",

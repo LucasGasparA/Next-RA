@@ -80,6 +80,7 @@ SAMPLE_FILE = BASE_DIR / "sample_response.json"
 
 DEFAULT_TAGS = ["Suporte Técnico", "CSM", "Aluno", "Comercial", "Produto"]
 DEFAULT_CATEGORIES: list[str] = []
+DEFAULT_CUSTOM_STATUSES = [("Moderada", "#8B7FA3"), ("Removida", "#FF6B6D")]
 ANSWERED_INTERACTION_TYPES = {"ANSWER", "FINAL_ANSWER", "REPLY"}
 AR_WINDOW_MONTHS = 6
 
@@ -315,12 +316,16 @@ def load_db() -> dict:
         db = json.loads(DB_FILE.read_text(encoding="utf-8"))
         db.setdefault("tags", list(DEFAULT_TAGS))
         db.setdefault("categorias", list(DEFAULT_CATEGORIES))
+        db.setdefault("responsaveis", [])
+        db.setdefault("custom_statuses", [{"name": n, "color": c} for n, c in DEFAULT_CUSTOM_STATUSES])
         db.setdefault("complaints", {})
         db.setdefault("monthly_overrides", {})  # ex: {"2026-06": {"sla": "8 dias e 5 horas"}}
         return db
     return {
         "tags": list(DEFAULT_TAGS),
         "categorias": list(DEFAULT_CATEGORIES),
+        "responsaveis": [],
+        "custom_statuses": [{"name": n, "color": c} for n, c in DEFAULT_CUSTOM_STATUSES],
         "complaints": {},
         "monthly_overrides": {},
     }
@@ -360,6 +365,7 @@ def merge_complaints(db: dict, fetched: list[dict], complete: bool = True) -> di
         record["id"] = cid
         record["tag_origem"] = existing.get("tag_origem")
         record["categoria"] = existing.get("categoria")
+        record["responsavel"] = existing.get("responsavel")
         record["first_seen"] = existing.get("first_seen", now)
         record["last_seen"] = now
         record["deactivated_at"] = None
@@ -398,18 +404,21 @@ class ManualComplaintError(ValueError):
     pass
 
 
-def build_manual_complaint(fields: dict) -> dict:
+def build_manual_complaint(fields: dict, known_statuses: set[str]) -> dict:
     """Monta um registro de reclamação no mesmo formato dos que vêm da API do
     RA, a partir do formulário "Adicionar reclamação" do dashboard. Fica
     marcado com source="manual" pra nunca ser desativado automaticamente por
     merge_complaints (ele nunca vai aparecer numa coleta da API, já que não
-    existe lá)."""
+    existe lá). known_statuses = os 5 nativos (códigos em caixa alta, vêm da
+    API) + os customizados criados em Configurações (nome como está, sem
+    normalizar caixa) — quem decide o conjunto válido é quem chama (tem
+    acesso ao banco), essa função só valida contra o que recebeu."""
     title = (fields.get("title") or "").strip()[:300]
     if not title:
         raise ManualComplaintError("Título é obrigatório.")
 
-    status = (fields.get("status") or "").strip().upper()
-    if status not in STATUS_LABELS:
+    status = (fields.get("status") or "").strip()
+    if status not in known_statuses:
         raise ManualComplaintError("Status inválido.")
 
     created_raw = (fields.get("created") or "").strip()
@@ -434,13 +443,16 @@ def build_manual_complaint(fields: dict) -> dict:
         solved = bool(fields.get("solved"))
         deal_again = bool(fields.get("deal_again"))
 
+    origins_raw = fields.get("origins")
+    origins = [str(o).strip()[:60] for o in origins_raw if o][:20] if isinstance(origins_raw, list) else []
+
     now = datetime.now().isoformat(timespec="seconds")
     return {
         "id": "manual-" + uuid.uuid4().hex[:12],
         "source": "manual",
         "title": title,
-        "userCity": (fields.get("city") or "").strip()[:120] or None,
-        "userState": (fields.get("state") or "").strip().upper()[:2] or None,
+        "userCity": None,
+        "userState": None,
         "status": status,
         "created": created,
         "score": score,
@@ -449,8 +461,9 @@ def build_manual_complaint(fields: dict) -> dict:
         "dealAgain": deal_again,
         "complainOrigin": "MANUAL",
         "interactions": [],
-        "tag_origem": (fields.get("tag_origem") or "").strip()[:60] or None,
+        "tag_origem": origins,
         "categoria": (fields.get("categoria") or "").strip()[:60] or None,
+        "responsavel": (fields.get("responsavel") or "").strip()[:60] or None,
         "first_seen": now,
         "last_seen": now,
         "deactivated_at": None,
@@ -467,10 +480,11 @@ def filter_complaints_for_export(
     status: str | None,
     origem: str | None,
     categoria: str | None,
+    responsavel: str | None = None,
 ) -> list[dict]:
     """Filtra reclamações ATIVAS pros mesmos critérios da tela (status/origem/
-    motivo), mais um período por data de criação (strings "YYYY-MM-DD",
-    inclusivas nas duas pontas). Usado pela exportação em PDF/CSV."""
+    motivo/responsável), mais um período por data de criação (strings
+    "YYYY-MM-DD", inclusivas nas duas pontas). Usado pela exportação em PDF/CSV."""
     rows = [c for c in db["complaints"].values() if not c.get("deactivated_at")]
     if start:
         rows = [c for c in rows if (c.get("created") or "")[:10] >= start]
@@ -479,36 +493,36 @@ def filter_complaints_for_export(
     if status:
         rows = [c for c in rows if (c.get("status") or "DESCONHECIDO") == status]
     if origem:
-        rows = [c for c in rows if (c.get("tag_origem") or "") == origem]
+        rows = [c for c in rows if origem in origins_of(c)]
     if categoria:
         rows = [c for c in rows if (c.get("categoria") or "") == categoria]
+    if responsavel:
+        rows = [c for c in rows if (c.get("responsavel") or "") == responsavel]
     return sorted(rows, key=lambda x: x.get("created", ""), reverse=True)
 
 
-def _export_row_fields(c: dict) -> tuple[str, str, str, str, str, str, str]:
+def _export_row_fields(c: dict, status_labels: dict) -> tuple[str, str, str, str, str, str, str]:
     created = c.get("created", "")
     try:
         created_fmt = datetime.fromisoformat(created).strftime("%d/%m/%Y %H:%M")
     except ValueError:
         created_fmt = created
-    city = c.get("userCity") or "—"
-    state = c.get("userState") or ""
-    cidade_uf = f"{city}/{state}" if state else city
     status = c.get("status") or "DESCONHECIDO"
-    status_label = STATUS_LABELS.get(status, status)
+    status_label = status_labels.get(status, status)
     score = c.get("score")
     nota = f"{score:.1f}" if score is not None else "—"
-    origem = c.get("tag_origem") or "—"
+    origem = ", ".join(origins_of(c)) or "—"
     categoria = c.get("categoria") or "—"
-    return (c.get("title") or "", cidade_uf, created_fmt, status_label, nota, origem, categoria)
+    responsavel = c.get("responsavel") or "—"
+    return (c.get("title") or "", responsavel, created_fmt, status_label, nota, origem, categoria)
 
 
-def generate_complaints_csv(rows: list[dict]) -> str:
+def generate_complaints_csv(rows: list[dict], status_labels: dict) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
-    writer.writerow(["Título", "Cidade/UF", "Criada em", "Status", "Nota", "Origem", "Motivo"])
+    writer.writerow(["Título", "Responsável", "Criada em", "Status", "Nota", "Origem", "Motivo"])
     for c in rows:
-        writer.writerow(_export_row_fields(c))
+        writer.writerow(_export_row_fields(c, status_labels))
     return "﻿" + buf.getvalue()  # BOM pro Excel reconhecer UTF-8 com acentos
 
 
@@ -526,7 +540,7 @@ def _pdf_safe(s: str) -> str:
     return s.encode("latin-1", errors="replace").decode("latin-1")
 
 
-def generate_complaints_pdf(rows: list[dict], start: str | None, end: str | None) -> bytes:
+def generate_complaints_pdf(rows: list[dict], start: str | None, end: str | None, status_labels: dict) -> bytes:
     from fpdf import FPDF  # import local: só usado nesta função, evita custo no boot
 
     periodo = f"{start or '(sem início)'} a {end or '(sem fim)'}"
@@ -542,7 +556,7 @@ def generate_complaints_pdf(rows: list[dict], start: str | None, end: str | None
     ), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
-    headers = ["Título", "Cidade/UF", "Criada em", "Status", "Nota", "Origem", "Motivo"]
+    headers = ["Título", "Responsável", "Criada em", "Status", "Nota", "Origem", "Motivo"]
     widths = [90, 35, 30, 32, 15, 35, 35]
     pdf.set_font("helvetica", "B", 9)
     with pdf.table(col_widths=widths, text_align="LEFT", line_height=6) as table:
@@ -552,7 +566,7 @@ def generate_complaints_pdf(rows: list[dict], start: str | None, end: str | None
         pdf.set_font("helvetica", "", 8.5)
         for c in rows:
             row = table.row()
-            for value in _export_row_fields(c):
+            for value in _export_row_fields(c, status_labels):
                 row.cell(_pdf_safe(value))
 
     return bytes(pdf.output())
@@ -704,7 +718,7 @@ def compute_monthly_evolution(db: dict, now: datetime, n_months: int = 7) -> lis
             "month_label": month_label(key),
             "eval_rate": round(100 * stats["n_evaluated"] / len(active), 1) if active else None,
             "sla_manual": overrides.get(key, {}).get("sla"),
-            "origin_counts": dict(Counter(c.get("tag_origem") or "Sem tag" for c in active)),
+            "origin_counts": count_origins(active),
             "categoria_counts": dict(Counter(c.get("categoria") or "Sem motivo" for c in active)),
         })
     return rows
@@ -757,10 +771,26 @@ def compute_ar_projection(db: dict, now: datetime, n_months: int = AR_WINDOW_MON
     return result
 
 
+def origins_of(c: dict) -> list[str]:
+    """Uma reclamação pode ter várias origens — tag_origem é uma lista desde
+    a introdução de multi-origem. Tolerante a dado legado (string única)."""
+    v = c.get("tag_origem")
+    if isinstance(v, list):
+        return [o for o in v if o]
+    return [v] if v else []
+
+
+def count_origins(complaints: list[dict]) -> dict:
+    """Uma reclamação com N origens soma 1 em cada um dos N baldes (não 1 só)."""
+    counter = Counter()
+    for c in complaints:
+        counter.update(origins_of(c) or ["Sem tag"])
+    return dict(counter)
+
+
 def compute_origin_breakdown(db: dict) -> dict:
     active = [c for c in db["complaints"].values() if not c.get("deactivated_at")]
-    counter = Counter(c.get("tag_origem") or "Sem tag" for c in active)
-    return dict(counter)
+    return count_origins(active)
 
 
 def compute_channel_breakdown(db: dict) -> dict:
@@ -828,6 +858,8 @@ def build_dashboard_data(db: dict, now: datetime | None = None) -> dict:
         "daily": compute_daily_volume(db),
         "tags": db.get("tags", list(DEFAULT_TAGS)),
         "categorias": db.get("categorias", list(DEFAULT_CATEGORIES)),
+        "responsaveis": db.get("responsaveis", []),
+        "custom_statuses": db.get("custom_statuses", [{"name": n, "color": c} for n, c in DEFAULT_CUSTOM_STATUSES]),
         "recent": sorted(active, key=lambda x: x.get("created", ""), reverse=True),
     }
 
@@ -1034,8 +1066,6 @@ STATUS_LABELS = {
     "FINISHED": "Finalizada",
     "FINISHED_NOT_EVALUATED": "Finalizada (sem avaliação)",
     "IN_TREATMENT": "Em tratamento",
-    "MODERATED": "Moderada",
-    "REMOVED": "Removida",
 }
 STATUS_COLORS = {
     "PENDING": "#FFC93D",
@@ -1043,9 +1073,24 @@ STATUS_COLORS = {
     "FINISHED": "#3DD68C",
     "FINISHED_NOT_EVALUATED": "#C77DF0",
     "IN_TREATMENT": "#FF8F5C",
-    "MODERATED": "#8B7FA3",
-    "REMOVED": "#FF6B6D",
 }
+# Status customizados (ex.: Moderada/Removida) são geridos pelo usuário em
+# Configurações e vêm de db["custom_statuses"] — não ficam fixos aqui porque
+# os 5 acima são os únicos que a API do RA realmente envia.
+
+
+def combined_status_labels(custom_statuses: list[dict]) -> dict:
+    labels = dict(STATUS_LABELS)
+    for s in custom_statuses:
+        labels[s["name"]] = s["name"]
+    return labels
+
+
+def combined_status_colors(custom_statuses: list[dict]) -> dict:
+    colors = dict(STATUS_COLORS)
+    for s in custom_statuses:
+        colors[s["name"]] = s["color"]
+    return colors
 
 
 def fmt(v, suffix="", none="—"):
@@ -1309,10 +1354,7 @@ CSS = """
   .pagination button:disabled { opacity: .4; cursor: default; }
   .pagination .pg-ellipsis { color: var(--ink-dim); font-size: 12px; padding: 0 2px; }
 
-  .manage-tags { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 4px; }
-  @media (max-width: 640px) { .manage-tags { grid-template-columns: 1fr; } }
-  .manage-tags-col p.small-label { font-size: 11.5px; font-weight: 700; color: var(--ink-soft); margin: 0 0 8px; }
-  .manage-tags-form { display: flex; gap: 8px; }
+  .manage-tags-form { display: flex; gap: 8px; margin: 0 0 10px; }
   .manage-tags-form input[type="text"] {
     flex: 1; background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 8px;
     padding: 7px 10px; font-size: 12.5px; font-family: inherit; min-width: 0;
@@ -1353,6 +1395,45 @@ CSS = """
   .delta-up { color: var(--mint); font-weight: 600; }
   .delta-down { color: var(--coral); font-weight: 600; }
   .delta-flat { color: var(--ink-dim); }
+
+  .chart-tooltip {
+    position: fixed; z-index: 70; background: var(--card); color: var(--ink); border: 1px solid var(--border-strong);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: var(--shadow); pointer-events: none;
+    white-space: nowrap;
+  }
+  .chart-tooltip[hidden] { display: none; }
+
+  .origin-picker { position: relative; display: inline-block; }
+  .origin-picker-btn {
+    appearance: none; background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 4px 8px; font-size: 12px; font-family: inherit; cursor: pointer; max-width: 160px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .origin-picker-menu {
+    position: fixed; z-index: 60; min-width: 180px; max-height: 240px; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--border-strong); border-radius: 10px;
+    box-shadow: var(--shadow); padding: 8px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .origin-picker-menu[hidden] { display: none; }
+  .origin-picker-menu label {
+    display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-soft);
+    padding: 5px 6px; border-radius: 6px; cursor: pointer;
+  }
+  .origin-picker-menu label:hover { background: var(--hover-surface); color: var(--ink); }
+
+  .settings-section-title { font-size: 12.5px; font-weight: 700; color: var(--ink-soft); margin: 18px 0 8px; }
+  .settings-section-title:first-of-type { margin-top: 0; }
+  .settings-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .settings-row .settings-rename-input {
+    flex: 1; min-width: 0; background: var(--canvas); color: var(--ink); border: 1px solid var(--border-strong);
+    border-radius: 6px; padding: 5px 8px; font-size: 12.5px; font-family: inherit;
+  }
+  .settings-row--locked { color: var(--ink-dim); padding: 5px 8px; }
+  .settings-row--locked span:first-child { flex: 1; font-size: 12.5px; }
+  .settings-locked-note { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+  .btn-xs { padding: 5px 10px !important; font-size: 11.5px !important; flex-shrink: 0; }
+  .btn-danger { color: var(--coral) !important; }
+  .btn-danger:hover { background: rgba(255,107,109,.12) !important; }
 
   .panel-header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
   .panel-header-actions { display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
@@ -1409,26 +1490,41 @@ function toggleTheme(){
 }
 applyThemeIcon();
 
-(function(){
-  // .dock usa backdrop-filter, que cria um "containing block" novo pra
-  // position:fixed em navegadores modernos (mesma regra de transform/filter) —
-  // sem isso o menu ficava preso dentro do dock mesmo com position:fixed.
-  // Movendo o nó pra fora (direto no <body>) ele escapa de qualquer ancestral
-  // com essa propriedade, agora ou no futuro.
-  var menu = document.getElementById('kebabMenu');
-  if (menu && menu.parentNode !== document.body) document.body.appendChild(menu);
-})();
+function reparentFloatingMenusToBody(selector){
+  // Qualquer ancestral com backdrop-filter/transform/filter/contain cria um
+  // "containing block" novo pra position:fixed em navegadores modernos — um
+  // menu flutuante preso dentro de uma célula de tabela ou do dock ficava
+  // "preso" ali mesmo sendo fixed. Movendo o nó pra ser filho direto do
+  // <body>, ele escapa de qualquer ancestral com essa propriedade, atual ou
+  // futuro, sem precisar saber qual é.
+  document.querySelectorAll(selector).forEach(function(menu){
+    if (menu.parentNode !== document.body) document.body.appendChild(menu);
+  });
+}
+function positionFloatingMenu(menu, anchorBtn, opts){
+  opts = opts || {};
+  var r = anchorBtn.getBoundingClientRect();
+  var menuWidth = opts.width || menu.offsetWidth || 220;
+  if (opts.align === 'left') {
+    var left = Math.max(8, r.left);
+    if (left + menuWidth > window.innerWidth - 8) left = window.innerWidth - menuWidth - 8;
+    menu.style.left = left + 'px';
+    menu.style.right = 'auto';
+  } else {
+    var right = Math.max(8, window.innerWidth - r.right);
+    if (right + menuWidth > window.innerWidth - 8) right = window.innerWidth - menuWidth - 8;
+    menu.style.right = right + 'px';
+    menu.style.left = 'auto';
+  }
+  menu.style.top = (r.bottom + 8) + 'px';
+}
+reparentFloatingMenusToBody('#kebabMenu');
 
 function positionKebabMenu(){
   var menu = document.getElementById('kebabMenu');
   var btn = document.getElementById('kebabToggle');
   if (!menu || !btn) return;
-  var r = btn.getBoundingClientRect();
-  var menuWidth = 220;
-  var right = Math.max(8, window.innerWidth - r.right);
-  if (right + menuWidth > window.innerWidth - 8) right = window.innerWidth - menuWidth - 8;
-  menu.style.top = (r.bottom + 10) + 'px';
-  menu.style.right = right + 'px';
+  positionFloatingMenu(menu, btn, {width: 220});
 }
 function toggleKebabMenu(force){
   var menu = document.getElementById('kebabMenu');
@@ -1463,17 +1559,20 @@ function applyComplaintFilters(){
   var statusEl = document.getElementById('rcFilterStatus');
   var origemEl = document.getElementById('rcFilterOrigem');
   var categoriaEl = document.getElementById('rcFilterCategoria');
+  var responsavelEl = document.getElementById('rcFilterResponsavel');
   if (!titleEl) return;
   var titleQ = (titleEl.value || '').toLowerCase().trim();
   var statusQ = statusEl.value, origemQ = origemEl.value, categoriaQ = categoriaEl.value;
+  var responsavelQ = responsavelEl ? responsavelEl.value : '';
   var rows = getComplaintRows();
   var visible = [];
   rows.forEach(function(tr){
     var ok = true;
     if (titleQ && tr.dataset.title.indexOf(titleQ) === -1) ok = false;
     if (ok && statusQ && tr.dataset.status !== statusQ) ok = false;
-    if (ok && origemQ && tr.dataset.origem !== origemQ) ok = false;
+    if (ok && origemQ && (tr.dataset.origem || '').split('|').indexOf(origemQ) === -1) ok = false;
     if (ok && categoriaQ && tr.dataset.categoria !== categoriaQ) ok = false;
+    if (ok && responsavelQ && tr.dataset.responsavel !== responsavelQ) ok = false;
     if (ok) visible.push(tr);
   });
   rcPage = 1;
@@ -1524,6 +1623,27 @@ function renderPagination(allRows, visibleRows, totalPages){
   addBtn('›', Math.min(totalPages, rcPage + 1), {disabled: rcPage === totalPages});
 }
 if (document.getElementById('rcTableBody')) applyComplaintFilters();
+
+(function(){
+  var tip = document.createElement('div');
+  tip.className = 'chart-tooltip';
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  function show(e, text){
+    tip.textContent = text;
+    tip.hidden = false;
+    var x = e.clientX + 14, y = e.clientY + 14;
+    if (x + 220 > window.innerWidth) x = e.clientX - 14 - tip.offsetWidth;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+  }
+  document.addEventListener('mousemove', function(e){
+    var target = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (target) { show(e, target.dataset.tip); }
+    else { tip.hidden = true; }
+  });
+  document.addEventListener('mouseleave', function(){ tip.hidden = true; });
+})();
 
 function escHtml(s){
   var d = document.createElement('div');
@@ -1712,21 +1832,6 @@ async function refreshData(){
     btn.disabled = false; btn.textContent = 'Atualizar agora';
   }
 }
-async function setTag(id, select){
-  const tag = select.value || null;
-  try {
-    const r = await fetch('/api/tag', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({id, tag})
-    });
-    const j = await r.json();
-    if (j.ok) { showToast(tag ? 'Tag salva: ' + tag : 'Tag removida', 'ok'); }
-    else { showToast('Erro ao salvar tag: ' + (j.error || 'desconhecido'), 'error'); }
-  } catch (e) {
-    showToast('Erro ao salvar tag: ' + e, 'error');
-  }
-}
 async function setCategoria(id, select){
   const categoria = select.value || null;
   try {
@@ -1742,48 +1847,62 @@ async function setCategoria(id, select){
     showToast('Erro ao salvar motivo: ' + e, 'error');
   }
 }
-function appendSelectOptions(kind, names){
-  var handlerPrefix = kind === 'origem' ? 'setTag(' : 'setCategoria(';
-  var filterSelect = document.getElementById(kind === 'origem' ? 'rcFilterOrigem' : 'rcFilterCategoria');
-  function addMissing(selectEl){
-    var existing = {};
-    Array.prototype.forEach.call(selectEl.options, function(o){ existing[o.value] = true; });
-    names.forEach(function(n){
-      if (!existing[n]) {
-        var o = document.createElement('option'); o.value = n; o.textContent = n; selectEl.appendChild(o);
-      }
-    });
-  }
-  if (filterSelect) addMissing(filterSelect);
-  document.querySelectorAll('#rcTableBody select.tag-select').forEach(function(sel){
-    var onchange = sel.getAttribute('onchange') || '';
-    if (onchange.indexOf(handlerPrefix) === 0) addMissing(sel);
-  });
-}
-async function addTagOption(evt, kind){
-  evt.preventDefault();
-  var input = document.getElementById(kind === 'origem' ? 'newOrigemInput' : 'newCategoriaInput');
-  var name = (input.value || '').trim();
-  if (!name) return false;
-  var endpoint = kind === 'origem' ? '/api/tags' : '/api/categorias';
+async function setResponsavel(id, select){
+  const responsavel = select.value || null;
   try {
-    const r = await fetch(endpoint, {
+    const r = await fetch('/api/responsavel', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: name})
+      body: JSON.stringify({id, responsavel})
     });
     const j = await r.json();
-    if (j.ok) {
-      appendSelectOptions(kind, kind === 'origem' ? j.tags : j.categorias);
-      input.value = '';
-      showToast((kind === 'origem' ? 'Origem' : 'Motivo') + ' criado(a): ' + name, 'ok');
-    } else {
-      showToast('Erro ao criar: ' + (j.error || 'desconhecido'), 'error');
-    }
+    if (j.ok) { showToast(responsavel ? 'Responsável salvo: ' + responsavel : 'Responsável removido', 'ok'); }
+    else { showToast('Erro ao salvar responsável: ' + (j.error || 'desconhecido'), 'error'); }
   } catch (e) {
-    showToast('Erro ao criar: ' + e, 'error');
+    showToast('Erro ao salvar responsável: ' + e, 'error');
   }
-  return false;
+}
+
+function originPickerSummary(list){
+  if (!list.length) return 'Sem tag';
+  if (list.length === 1) return list[0];
+  return list.length + ' origens';
+}
+reparentFloatingMenusToBody('.origin-picker-menu');
+function toggleOriginPicker(btn, force){
+  var menu = document.querySelector('.origin-picker-menu[data-for="' + btn.dataset.pickerId + '"]');
+  if (!menu) return;
+  var show = typeof force === 'boolean' ? force : menu.hidden;
+  document.querySelectorAll('.origin-picker-menu').forEach(function(m){ if (m !== menu) m.hidden = true; });
+  if (show) positionFloatingMenu(menu, btn, {align: 'left', width: 200});
+  menu.hidden = !show;
+}
+document.addEventListener('click', function(e){
+  if (!e.target.closest('.origin-picker') && !e.target.closest('.origin-picker-menu')) {
+    document.querySelectorAll('.origin-picker-menu').forEach(function(m){ m.hidden = true; });
+  }
+});
+window.addEventListener('scroll', function(){
+  document.querySelectorAll('.origin-picker-menu').forEach(function(m){ m.hidden = true; });
+}, true);
+async function onOriginCheckboxChange(cid, checkbox){
+  var menu = checkbox.closest('.origin-picker-menu');
+  var btn = document.querySelector('.origin-picker-btn[data-picker-id="' + menu.dataset.for + '"]');
+  var checked = Array.prototype.filter.call(menu.querySelectorAll('input[type=checkbox]'), function(c){ return c.checked; })
+    .map(function(c){ return c.value; });
+  btn.textContent = originPickerSummary(checked);
+  try {
+    const r = await fetch('/api/tag', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: cid, tags: checked})
+    });
+    const j = await r.json();
+    if (j.ok) { showToast('Origem salva', 'ok'); }
+    else { showToast('Erro ao salvar origem: ' + (j.error || 'desconhecido'), 'error'); }
+  } catch (e) {
+    showToast('Erro ao salvar origem: ' + e, 'error');
+  }
 }
 
 function todayStr(){
@@ -1811,14 +1930,15 @@ function closeAddComplaintModal(){
     var errEl = document.getElementById('addComplaintError');
     errEl.hidden = true;
     var scoreVal = document.getElementById('addCScore').value;
+    var origins = Array.prototype.filter.call(document.querySelectorAll('.addc-origin-box'), function(c){ return c.checked; })
+      .map(function(c){ return c.value; });
     var payload = {
       title: document.getElementById('addCTitle').value,
-      city: document.getElementById('addCCity').value,
-      state: document.getElementById('addCState').value,
       status: document.getElementById('addCStatus').value,
       created: document.getElementById('addCCreated').value,
-      tag_origem: document.getElementById('addCOrigem').value,
+      origins: origins,
       categoria: document.getElementById('addCCategoria').value,
+      responsavel: document.getElementById('addCResponsavel').value,
       score: scoreVal === '' ? null : scoreVal,
       solved: document.getElementById('addCSolved').checked,
       deal_again: document.getElementById('addCDealAgain').checked
@@ -1860,12 +1980,14 @@ function closeExportModal(){
     var status = document.getElementById('expStatus').value;
     var origem = document.getElementById('expOrigem').value;
     var categoria = document.getElementById('expCategoria').value;
+    var responsavel = document.getElementById('expResponsavel').value;
     var format = document.querySelector('input[name="expFormat"]:checked').value;
     if (start) params.set('start', start);
     if (end) params.set('end', end);
     if (status) params.set('status', status);
     if (origem) params.set('origem', origem);
     if (categoria) params.set('categoria', categoria);
+    if (responsavel) params.set('responsavel', responsavel);
     params.set('format', format);
     window.open('/export/complaints?' + params.toString(), '_blank');
     closeExportModal();
@@ -1910,6 +2032,75 @@ async function copyReportMarkdown(){
   if (!dlg) return;
   dlg.addEventListener('click', function(e){ if (e.target === dlg) closeReportModal(); });
 })();
+
+var SETTINGS_ENDPOINTS = {
+  tags: '/api/tags', categorias: '/api/categorias',
+  responsaveis: '/api/responsaveis', statuses: '/api/statuses'
+};
+function openSettingsModal(){
+  document.getElementById('settingsError').hidden = true;
+  document.getElementById('settingsModal').showModal();
+}
+function closeSettingsModal(){
+  document.getElementById('settingsModal').close();
+}
+(function(){
+  var dlg = document.getElementById('settingsModal');
+  if (!dlg) return;
+  dlg.addEventListener('click', function(e){ if (e.target === dlg) closeSettingsModal(); });
+})();
+function settingsError(msg){
+  var el = document.getElementById('settingsError');
+  el.textContent = msg;
+  el.hidden = false;
+}
+async function renameSettingsItem(kind, oldName, btn){
+  var row = btn.closest('.settings-row');
+  var input = row.querySelector('.settings-rename-input');
+  var newName = (input.value || '').trim();
+  if (!newName || newName === oldName) return;
+  document.getElementById('settingsError').hidden = true;
+  try {
+    const r = await fetch(SETTINGS_ENDPOINTS[kind] + '/rename', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old: oldName, new: newName})
+    });
+    const j = await r.json();
+    if (j.ok) { location.reload(); }
+    else { settingsError(j.error || 'Erro ao renomear.'); }
+  } catch (e) { settingsError('Erro ao renomear: ' + e); }
+}
+async function deleteSettingsItem(kind, name){
+  if (!confirm('Excluir "' + name + '"? Essa ação não pode ser desfeita.')) return;
+  document.getElementById('settingsError').hidden = true;
+  try {
+    const r = await fetch(SETTINGS_ENDPOINTS[kind] + '/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const j = await r.json();
+    if (j.ok) { location.reload(); }
+    else { settingsError(j.error || 'Erro ao excluir.'); }
+  } catch (e) { settingsError('Erro ao excluir: ' + e); }
+}
+async function addSettingsItem(evt, kind){
+  evt.preventDefault();
+  var inputId = {tags: 'newTagsInput', categorias: 'newCategoriasInput', responsaveis: 'newResponsaveisInput', statuses: 'newStatusesInput'}[kind];
+  var input = document.getElementById(inputId);
+  var name = (input.value || '').trim();
+  if (!name) return false;
+  document.getElementById('settingsError').hidden = true;
+  try {
+    const r = await fetch(SETTINGS_ENDPOINTS[kind], {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    const j = await r.json();
+    if (j.ok) { location.reload(); }
+    else { settingsError(j.error || 'Erro ao criar.'); }
+  } catch (e) { settingsError('Erro ao criar: ' + e); }
+  return false;
+}
 </script>
 """
 
@@ -1924,6 +2115,8 @@ def render_dashboard(
     proj = data["projection"]
     monthly = data["monthly"]
     daily = data["daily"]
+    status_labels = combined_status_labels(data["custom_statuses"])
+    status_colors = combined_status_colors(data["custom_statuses"])
 
     max_count = max((d["count"] for d in daily), default=1) or 1
     bars_html = []
@@ -1944,8 +2137,8 @@ def render_dashboard(
     total_status = sum(data["status"].values()) or 1
     for status, count in sorted(data["status"].items(), key=lambda x: -x[1]):
         pct = round(100 * count / total_status, 1)
-        label = STATUS_LABELS.get(status, status)
-        color = STATUS_COLORS.get(status, "#605E5C")
+        label = status_labels.get(status, status)
+        color = status_colors.get(status, "#605E5C")
         status_rows.append(
             f'<div class="status-row">'
             f'<div class="status-row-top"><span class="dot" style="background:{color}"></span>'
@@ -2114,7 +2307,7 @@ def render_dashboard(
     </div>
     <p class="panel-note" style="margin:0 0 16px">&#128161; {esc(turnover_insight)}</p>"""
 
-    # --- tabela de reclamações (com tag de origem e motivo/categoria) ---
+    # --- tabela de reclamações (com origem múltipla, motivo e responsável) ---
     def build_select(cid: str, current: str, options: list[str], empty_label: str, css_class: str, handler: str) -> str:
         # antes isso era montado com um .replace() em cima da string de options
         # pra injetar o "selected" — quebrava se o nome de uma tag fosse prefixo
@@ -2129,6 +2322,31 @@ def render_dashboard(
             f'{"".join(opts)}</select>'
         )
 
+    def origin_summary(origins: list[str]) -> str:
+        if not origins:
+            return "Sem tag"
+        if len(origins) == 1:
+            return origins[0]
+        return f"{len(origins)} origens"
+
+    def build_origin_picker(cid: str, current: list[str], options: list[str]) -> str:
+        cid_js = esc(json.dumps(str(cid)))
+        picker_id = f"op-{esc(str(cid))}"
+        boxes = []
+        for t in options:
+            checked = " checked" if t in current else ""
+            boxes.append(
+                f'<label><input type="checkbox" value="{esc(t)}"{checked} '
+                f'onchange="onOriginCheckboxChange({cid_js}, this)"> {esc(t)}</label>'
+            )
+        return (
+            f'<div class="origin-picker">'
+            f'<button type="button" class="origin-picker-btn" data-picker-id="{picker_id}" '
+            f'onclick="toggleOriginPicker(this)">{esc(origin_summary(current))}</button>'
+            f'<div class="origin-picker-menu" data-for="{picker_id}" hidden>{"".join(boxes)}</div>'
+            f'</div>'
+        )
+
     table_rows = []
     for c in data["recent"]:
         created = c.get("created", "")
@@ -2137,46 +2355,49 @@ def render_dashboard(
         except ValueError:
             created_fmt = created
         status = c.get("status") or "DESCONHECIDO"
-        status_label = STATUS_LABELS.get(status, status)
-        status_color = STATUS_COLORS.get(status, "#605E5C")
+        status_label = status_labels.get(status, status)
+        status_color = status_colors.get(status, "#605E5C")
         score = c.get("score")
         score_html = f'<span style="color:{score_color(score)}">{score:.1f}</span>' if score is not None else "—"
-        city = c.get("userCity") or "—"
-        state = c.get("userState") or ""
         title_full = (c.get("title") or "").strip()
         title = title_full
         if len(title) > 60:
             title = title[:57] + "…"
         cid = c.get("id")
-        current_tag = c.get("tag_origem") or ""
+        current_origins = origins_of(c)
         current_categoria = c.get("categoria") or ""
+        current_responsavel = c.get("responsavel") or ""
         if interactive:
-            tag_cell = build_select(cid, current_tag, data["tags"], "Sem tag", "tag-select", "setTag")
+            origin_cell = build_origin_picker(cid, current_origins, data["tags"])
             categoria_cell = build_select(cid, current_categoria, data["categorias"], "Sem motivo", "tag-select", "setCategoria")
+            responsavel_cell = build_select(cid, current_responsavel, data["responsaveis"], "Sem responsável", "tag-select", "setResponsavel")
         else:
-            tag_cell = esc(current_tag) or '<span style="color:var(--ink-dim)">—</span>'
+            origin_cell = esc(", ".join(current_origins)) or '<span style="color:var(--ink-dim)">—</span>'
             categoria_cell = esc(current_categoria) or '<span style="color:var(--ink-dim)">—</span>'
+            responsavel_cell = esc(current_responsavel) or '<span style="color:var(--ink-dim)">—</span>'
         row_attrs = (
-            f' data-status="{esc(status)}" data-origem="{esc(current_tag)}"'
-            f' data-categoria="{esc(current_categoria)}" data-title="{esc(title_full.lower())}"'
+            f' data-status="{esc(status)}" data-origem="{esc("|".join(current_origins))}"'
+            f' data-categoria="{esc(current_categoria)}" data-responsavel="{esc(current_responsavel)}"'
+            f' data-title="{esc(title_full.lower())}"'
         )
         table_rows.append(
             f"<tr{row_attrs}><td class='title-cell'>{esc(title)}</td>"
-            f"<td>{esc(city)}{'/' + esc(state) if state else ''}</td>"
+            f"<td>{responsavel_cell}</td>"
             f"<td class='mono'>{esc(created_fmt)}</td>"
             f"<td><span class='pill' style='background:{status_color}22;color:{status_color}'>{esc(status_label)}</span></td>"
             f"<td class='mono score-cell'>{score_html}</td>"
-            f"<td>{tag_cell}</td>"
+            f"<td>{origin_cell}</td>"
             f"<td>{categoria_cell}</td></tr>"
         )
     table_html = "\n".join(table_rows) or '<tr><td colspan="7" class="empty">Nenhuma reclamação ativa.</td></tr>'
 
     status_filter_opts = "".join(
-        f'<option value="{esc(s)}">{esc(STATUS_LABELS.get(s, s))}</option>'
+        f'<option value="{esc(s)}">{esc(status_labels.get(s, s))}</option>'
         for s in sorted(data["status"].keys())
     )
     origem_filter_opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in data["tags"])
     categoria_filter_opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in data["categorias"])
+    responsavel_filter_opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in data["responsaveis"])
 
     updated_str = data["updated_at"].strftime("%d/%m/%Y às %H:%M")
     stale_hours = (datetime.now() - data["updated_at"]).total_seconds() / 3600
@@ -2235,27 +2456,69 @@ def render_dashboard(
   </div>
 </dialog>""" if interactive else ""
     token_modal_html = TOKEN_MODAL_HTML if interactive else ""
-    manage_tags_html = f"""
-  <div class="panel">
-    <p class="panel-title">Gerenciar origens e categorias</p>
-    <p class="panel-note">Cria novas opções pros seletores de Origem e Motivo acima.</p>
-    <div class="manage-tags">
-      <div class="manage-tags-col">
-        <p class="small-label">Nova origem</p>
-        <form class="manage-tags-form" onsubmit="return addTagOption(event, 'origem')">
-          <input type="text" id="newOrigemInput" placeholder="Ex.: Financeiro" maxlength="60">
-          <button type="submit" class="btn btn-ghost">Adicionar</button>
-        </form>
-      </div>
-      <div class="manage-tags-col">
-        <p class="small-label">Novo motivo</p>
-        <form class="manage-tags-form" onsubmit="return addTagOption(event, 'categoria')">
-          <input type="text" id="newCategoriaInput" placeholder="Ex.: Cobrança indevida" maxlength="60">
-          <button type="submit" class="btn btn-ghost">Adicionar</button>
-        </form>
-      </div>
+    def settings_rows(kind: str, items: list[str], locked: list[str] = ()) -> str:
+        rows = []
+        for name in locked:
+            rows.append(
+                f'<div class="settings-row settings-row--locked"><span>{esc(name)}</span>'
+                f'<span class="settings-locked-note">da API do RA</span></div>'
+            )
+        for name in items:
+            name_js = esc(json.dumps(name))
+            rows.append(
+                f'<div class="settings-row">'
+                f'<input type="text" class="settings-rename-input" value="{esc(name)}">'
+                f'<button type="button" class="btn-ghost btn-xs" onclick="renameSettingsItem(\'{kind}\', {name_js}, this)">Salvar</button>'
+                f'<button type="button" class="btn-ghost btn-xs btn-danger" onclick="deleteSettingsItem(\'{kind}\', {name_js})">Excluir</button>'
+                f'</div>'
+            )
+        return "".join(rows) or '<p class="empty" style="margin:0 0 8px">Nada cadastrado ainda.</p>'
+
+    settings_modal_html = f"""
+<dialog id="settingsModal" class="modal modal--wide">
+  <div class="modal-form">
+    <p class="panel-title" style="margin-bottom:6px">Configurações</p>
+    <p class="panel-note">Cria, renomeia e exclui as opções usadas em Origem, Motivo, Status e Responsável.</p>
+
+    <p class="settings-section-title">Origens</p>
+    <div id="settingsTags">{settings_rows('tags', data['tags'])}</div>
+    <form class="manage-tags-form" onsubmit="return addSettingsItem(event, 'tags')">
+      <input type="text" id="newTagsInput" placeholder="Nova origem" maxlength="60">
+      <button type="submit" class="btn btn-ghost">Adicionar</button>
+    </form>
+
+    <p class="settings-section-title">Motivos</p>
+    <div id="settingsCategorias">{settings_rows('categorias', data['categorias'])}</div>
+    <form class="manage-tags-form" onsubmit="return addSettingsItem(event, 'categorias')">
+      <input type="text" id="newCategoriasInput" placeholder="Novo motivo" maxlength="60">
+      <button type="submit" class="btn btn-ghost">Adicionar</button>
+    </form>
+
+    <p class="settings-section-title">Responsáveis</p>
+    <div id="settingsResponsaveis">{settings_rows('responsaveis', data['responsaveis'])}</div>
+    <form class="manage-tags-form" onsubmit="return addSettingsItem(event, 'responsaveis')">
+      <input type="text" id="newResponsaveisInput" placeholder="Novo responsável" maxlength="60">
+      <button type="submit" class="btn btn-ghost">Adicionar</button>
+    </form>
+
+    <p class="settings-section-title">Status</p>
+    <div id="settingsStatuses">{settings_rows('statuses', [s['name'] for s in data['custom_statuses']], locked=list(STATUS_LABELS.values()))}</div>
+    <form class="manage-tags-form" onsubmit="return addSettingsItem(event, 'statuses')">
+      <input type="text" id="newStatusesInput" placeholder="Novo status (ex.: Em recurso)" maxlength="60">
+      <button type="submit" class="btn btn-ghost">Adicionar</button>
+    </form>
+
+    <p style="color:var(--coral);font-size:12px;margin:14px 0 0" id="settingsError" hidden></p>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeSettingsModal()">Fechar</button>
     </div>
-  </div>""" if interactive else ""
+  </div>
+</dialog>""" if interactive else ""
+
+    settings_button_html = (
+        '<button type="button" class="kebab-item" onclick="openSettingsModal()">Configurações</button>'
+        if interactive else ""
+    )
 
     rc_action_buttons_html = (
         '<div class="panel-header-actions">'
@@ -2265,8 +2528,11 @@ def render_dashboard(
     ) if interactive else ""
 
     status_form_opts = "".join(
-        f'<option value="{esc(code)}">{esc(label)}</option>' for code, label in STATUS_LABELS.items()
+        f'<option value="{esc(code)}">{esc(label)}</option>' for code, label in status_labels.items()
     )
+    add_origin_checkboxes = "".join(
+        f'<label><input type="checkbox" class="addc-origin-box" value="{esc(t)}"> {esc(t)}</label>' for t in data["tags"]
+    ) or '<p class="empty" style="margin:0">Nenhuma origem cadastrada ainda — crie em Configurações.</p>'
     add_complaint_modal_html = f"""
 <dialog id="addComplaintModal" class="modal">
   <form class="modal-form" id="addComplaintForm">
@@ -2275,16 +2541,16 @@ def render_dashboard(
     <p style="color:var(--coral);font-size:12px;margin:0 0 10px" id="addComplaintError" hidden></p>
     <label class="modal-field"><span>Título *</span><input type="text" id="addCTitle" maxlength="300" required></label>
     <div class="modal-field-row">
-      <label class="modal-field"><span>Cidade</span><input type="text" id="addCCity" maxlength="120"></label>
-      <label class="modal-field modal-field--narrow"><span>UF</span><input type="text" id="addCState" maxlength="2"></label>
-    </div>
-    <div class="modal-field-row">
       <label class="modal-field"><span>Status *</span><select id="addCStatus" required>{status_form_opts}</select></label>
       <label class="modal-field modal-field--narrow"><span>Data *</span><input type="date" id="addCCreated" required></label>
     </div>
     <div class="modal-field-row">
-      <label class="modal-field"><span>Origem</span><select id="addCOrigem"><option value="">Sem tag</option>{origem_filter_opts}</select></label>
       <label class="modal-field"><span>Motivo</span><select id="addCCategoria"><option value="">Sem motivo</option>{categoria_filter_opts}</select></label>
+      <label class="modal-field"><span>Responsável</span><select id="addCResponsavel"><option value="">Sem responsável</option>{responsavel_filter_opts}</select></label>
+    </div>
+    <div class="modal-field">
+      <span>Origem (pode marcar mais de uma)</span>
+      <div class="modal-check-row" style="flex-wrap:wrap;margin:0">{add_origin_checkboxes}</div>
     </div>
     <label class="modal-field"><span>Nota (0–10, opcional — só se já foi avaliada)</span><input type="number" id="addCScore" min="0" max="10" step="0.1"></label>
     <div class="modal-check-row">
@@ -2312,6 +2578,7 @@ def render_dashboard(
       <label class="modal-field"><span>Origem</span><select id="expOrigem"><option value="">Todas</option>{origem_filter_opts}</select></label>
       <label class="modal-field"><span>Motivo</span><select id="expCategoria"><option value="">Todos</option>{categoria_filter_opts}</select></label>
     </div>
+    <label class="modal-field"><span>Responsável</span><select id="expResponsavel"><option value="">Todos</option>{responsavel_filter_opts}</select></label>
     <div class="modal-field">
       <span>Formato</span>
       <div class="modal-radio-row">
@@ -2367,6 +2634,7 @@ def render_dashboard(
         <button type="button" class="kebab-item" onclick="toggleTheme()"><span id="themeToggleLabel">Mudar para tema claro</span></button>
         {refresh_button}
         {report_button_html}
+        {settings_button_html}
         <div class="kebab-links">{extra_header_html}</div>
       </div>
     </div>
@@ -2558,19 +2826,21 @@ def render_dashboard(
         <option value="">Todo motivo</option>
         {categoria_filter_opts}
       </select>
+      <select id="rcFilterResponsavel" onchange="applyComplaintFilters()">
+        <option value="">Todo responsável</option>
+        {responsavel_filter_opts}
+      </select>
     </div>
     <p class="filter-count" id="rcFilterCount"></p>
 
     <table id="rcTable">
-      <thead><tr><th>Título</th><th>Cidade/UF</th><th>Criada em</th><th>Status</th><th>Nota</th><th>Origem</th><th>Motivo</th></tr></thead>
+      <thead><tr><th>Título</th><th>Responsável</th><th>Criada em</th><th>Status</th><th>Nota</th><th>Origem</th><th>Motivo</th></tr></thead>
       <tbody id="rcTableBody">
         {table_html}
       </tbody>
     </table>
     <div class="pagination" id="rcPagination"></div>
   </div>
-
-  {manage_tags_html}
 
   </div>
 
@@ -2591,6 +2861,7 @@ def render_dashboard(
 {add_complaint_modal_html}
 {export_modal_html}
 {report_modal_html}
+{settings_modal_html}
 {script}
 </body>
 </html>
@@ -2664,13 +2935,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/tag":
             cid = str(body.get("id", ""))
-            tag = body.get("tag") or None
+            tags_raw = body.get("tags")
+            tags = [str(t).strip()[:60] for t in tags_raw if t] if isinstance(tags_raw, list) else []
             with DB_LOCK:
                 db = load_db()
                 if cid in db["complaints"]:
-                    db["complaints"][cid]["tag_origem"] = tag
-                    if tag and tag not in db["tags"]:
-                        db["tags"].append(tag)
+                    db["complaints"][cid]["tag_origem"] = tags
+                    for t in tags:
+                        if t not in db["tags"]:
+                            db["tags"].append(t)
                     save_db(db)
                     ok = True
                 else:
