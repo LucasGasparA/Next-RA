@@ -34,7 +34,9 @@ SOBRE O BANCO LOCAL (data/complaints_db.json):
 
 import argparse
 import calendar
+import csv
 import html as html_lib
+import io
 import json
 import statistics
 import sys
@@ -42,6 +44,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -359,6 +362,11 @@ def merge_complaints(db: dict, fetched: list[dict], complete: bool = True) -> di
     if complete:
         desativadas = 0
         for cid, rec in db["complaints"].items():
+            # reclamações criadas manualmente nunca vêm na listagem da API —
+            # não fazem parte da coleta, então nunca devem ser desativadas por
+            # "sumirem" dela.
+            if rec.get("source") == "manual":
+                continue
             if cid not in fetched_ids and rec.get("deactivated_at") is None:
                 rec["deactivated_at"] = now
                 desativadas += 1
@@ -378,6 +386,170 @@ def merge_complaints(db: dict, fetched: list[dict], complete: bool = True) -> di
 
     db["last_sync"] = {"at": now, "complete": complete, "fetched": len(fetched_ids)}
     return db
+
+
+class ManualComplaintError(ValueError):
+    pass
+
+
+def build_manual_complaint(fields: dict) -> dict:
+    """Monta um registro de reclamação no mesmo formato dos que vêm da API do
+    RA, a partir do formulário "Adicionar reclamação" do dashboard. Fica
+    marcado com source="manual" pra nunca ser desativado automaticamente por
+    merge_complaints (ele nunca vai aparecer numa coleta da API, já que não
+    existe lá)."""
+    title = (fields.get("title") or "").strip()[:300]
+    if not title:
+        raise ManualComplaintError("Título é obrigatório.")
+
+    status = (fields.get("status") or "").strip().upper()
+    if status not in STATUS_LABELS:
+        raise ManualComplaintError("Status inválido.")
+
+    created_raw = (fields.get("created") or "").strip()
+    try:
+        created = datetime.strptime(created_raw, "%Y-%m-%d").isoformat()
+    except ValueError:
+        raise ManualComplaintError("Data de criação inválida.") from None
+
+    score_raw = fields.get("score")
+    score = None
+    evaluated = False
+    solved = False
+    deal_again = False
+    if score_raw not in (None, ""):
+        try:
+            score = float(score_raw)
+        except (TypeError, ValueError):
+            raise ManualComplaintError("Nota inválida.") from None
+        if not (0 <= score <= 10):
+            raise ManualComplaintError("Nota precisa estar entre 0 e 10.")
+        evaluated = True
+        solved = bool(fields.get("solved"))
+        deal_again = bool(fields.get("deal_again"))
+
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "id": "manual-" + uuid.uuid4().hex[:12],
+        "source": "manual",
+        "title": title,
+        "userCity": (fields.get("city") or "").strip()[:120] or None,
+        "userState": (fields.get("state") or "").strip().upper()[:2] or None,
+        "status": status,
+        "created": created,
+        "score": score,
+        "evaluated": evaluated,
+        "solved": solved,
+        "dealAgain": deal_again,
+        "complainOrigin": "MANUAL",
+        "interactions": [],
+        "tag_origem": (fields.get("tag_origem") or "").strip()[:60] or None,
+        "categoria": (fields.get("categoria") or "").strip()[:60] or None,
+        "first_seen": now,
+        "last_seen": now,
+        "deactivated_at": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# EXPORTAÇÃO (PDF / CSV) — tela de Reclamações, por período + filtros
+# ---------------------------------------------------------------------------
+def filter_complaints_for_export(
+    db: dict,
+    start: str | None,
+    end: str | None,
+    status: str | None,
+    origem: str | None,
+    categoria: str | None,
+) -> list[dict]:
+    """Filtra reclamações ATIVAS pros mesmos critérios da tela (status/origem/
+    motivo), mais um período por data de criação (strings "YYYY-MM-DD",
+    inclusivas nas duas pontas). Usado pela exportação em PDF/CSV."""
+    rows = [c for c in db["complaints"].values() if not c.get("deactivated_at")]
+    if start:
+        rows = [c for c in rows if (c.get("created") or "")[:10] >= start]
+    if end:
+        rows = [c for c in rows if (c.get("created") or "")[:10] <= end]
+    if status:
+        rows = [c for c in rows if (c.get("status") or "DESCONHECIDO") == status]
+    if origem:
+        rows = [c for c in rows if (c.get("tag_origem") or "") == origem]
+    if categoria:
+        rows = [c for c in rows if (c.get("categoria") or "") == categoria]
+    return sorted(rows, key=lambda x: x.get("created", ""), reverse=True)
+
+
+def _export_row_fields(c: dict) -> tuple[str, str, str, str, str, str, str]:
+    created = c.get("created", "")
+    try:
+        created_fmt = datetime.fromisoformat(created).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        created_fmt = created
+    city = c.get("userCity") or "—"
+    state = c.get("userState") or ""
+    cidade_uf = f"{city}/{state}" if state else city
+    status = c.get("status") or "DESCONHECIDO"
+    status_label = STATUS_LABELS.get(status, status)
+    score = c.get("score")
+    nota = f"{score:.1f}" if score is not None else "—"
+    origem = c.get("tag_origem") or "—"
+    categoria = c.get("categoria") or "—"
+    return (c.get("title") or "", cidade_uf, created_fmt, status_label, nota, origem, categoria)
+
+
+def generate_complaints_csv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(["Título", "Cidade/UF", "Criada em", "Status", "Nota", "Origem", "Motivo"])
+    for c in rows:
+        writer.writerow(_export_row_fields(c))
+    return "﻿" + buf.getvalue()  # BOM pro Excel reconhecer UTF-8 com acentos
+
+
+def _pdf_safe(s: str) -> str:
+    """As fontes 'core' do fpdf2 (helvetica) só suportam Latin-1 estrito —
+    travessão, reticências e aspas tipográficas (comuns em texto livre de
+    título de reclamação) não entram e derrubavam a geração do PDF. Troca
+    pelos equivalentes ASCII e, por segurança, substitui qualquer outro
+    caractere fora do Latin-1 em vez de quebrar a exportação inteira."""
+    s = s or ""
+    s = (
+        s.replace("—", "-").replace("–", "-").replace("…", "...")
+        .replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    )
+    return s.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def generate_complaints_pdf(rows: list[dict], start: str | None, end: str | None) -> bytes:
+    from fpdf import FPDF  # import local: só usado nesta função, evita custo no boot
+
+    periodo = f"{start or '(sem início)'} a {end or '(sem fim)'}"
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_font("helvetica", "B", 16)
+    pdf.cell(0, 10, _pdf_safe("Next RA - Reclamações"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("helvetica", "", 10)
+    pdf.cell(0, 6, _pdf_safe(
+        f"Período: {periodo}  -  Total: {len(rows)} reclamação(ões)  -  "
+        f"Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    ), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    headers = ["Título", "Cidade/UF", "Criada em", "Status", "Nota", "Origem", "Motivo"]
+    widths = [90, 35, 30, 32, 15, 35, 35]
+    pdf.set_font("helvetica", "B", 9)
+    with pdf.table(col_widths=widths, text_align="LEFT", line_height=6) as table:
+        header_row = table.row()
+        for h in headers:
+            header_row.cell(_pdf_safe(h))
+        pdf.set_font("helvetica", "", 8.5)
+        for c in rows:
+            row = table.row()
+            for value in _export_row_fields(c):
+                row.cell(_pdf_safe(value))
+
+    return bytes(pdf.output())
 
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1168,22 @@ CSS = """
   .delta-up { color: var(--mint); font-weight: 600; }
   .delta-down { color: var(--coral); font-weight: 600; }
   .delta-flat { color: var(--ink-dim); }
+
+  .panel-header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  .panel-header-actions { display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+  .panel-header-actions .btn { padding: 7px 14px; font-size: 12.5px; }
+
+  .modal-field { display: block; margin: 0 0 12px; }
+  .modal-field span { display: block; font-size: 11.5px; font-weight: 700; color: var(--ink-soft); margin-bottom: 5px; }
+  .modal-field input[type="text"], .modal-field input[type="date"], .modal-field input[type="number"], .modal-field select {
+    width: 100%; box-sizing: border-box; border: 1px solid var(--border-strong); border-radius: 8px;
+    background: var(--canvas); color: var(--ink); padding: 8px 10px; font-size: 13px; font-family: inherit;
+  }
+  .modal-field-row { display: flex; gap: 10px; }
+  .modal-field-row .modal-field { flex: 1; min-width: 0; }
+  .modal-field--narrow { flex: 0 0 90px !important; }
+  .modal-check-row, .modal-radio-row { display: flex; gap: 16px; font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; }
+  .modal-check-row label, .modal-radio-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 """
 
 TABS_JS = """
@@ -1405,6 +1593,92 @@ async function addTagOption(evt, kind){
   }
   return false;
 }
+
+function todayStr(){
+  var d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function openAddComplaintModal(){
+  var dlg = document.getElementById('addComplaintModal');
+  document.getElementById('addComplaintError').hidden = true;
+  document.getElementById('addComplaintForm').reset();
+  document.getElementById('addCCreated').value = todayStr();
+  dlg.showModal();
+  document.getElementById('addCTitle').focus();
+}
+function closeAddComplaintModal(){
+  document.getElementById('addComplaintModal').close();
+}
+(function(){
+  var dlg = document.getElementById('addComplaintModal');
+  if (!dlg) return;
+  dlg.addEventListener('click', function(e){ if (e.target === dlg) closeAddComplaintModal(); });
+  document.getElementById('addComplaintForm').addEventListener('submit', async function(e){
+    e.preventDefault();
+    var btn = document.getElementById('addComplaintSubmit');
+    var errEl = document.getElementById('addComplaintError');
+    errEl.hidden = true;
+    var scoreVal = document.getElementById('addCScore').value;
+    var payload = {
+      title: document.getElementById('addCTitle').value,
+      city: document.getElementById('addCCity').value,
+      state: document.getElementById('addCState').value,
+      status: document.getElementById('addCStatus').value,
+      created: document.getElementById('addCCreated').value,
+      tag_origem: document.getElementById('addCOrigem').value,
+      categoria: document.getElementById('addCCategoria').value,
+      score: scoreVal === '' ? null : scoreVal,
+      solved: document.getElementById('addCSolved').checked,
+      deal_again: document.getElementById('addCDealAgain').checked
+    };
+    btn.disabled = true; btn.textContent = 'Adicionando...';
+    try {
+      const r = await fetch('/api/complaints/manual', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      if (j.ok) { queueToast('Reclamação adicionada com sucesso.', 'ok'); location.reload(); }
+      else { errEl.textContent = j.error || 'Erro desconhecido'; errEl.hidden = false; }
+    } catch (err) {
+      errEl.textContent = 'Erro de rede: ' + err;
+      errEl.hidden = false;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Adicionar';
+    }
+  });
+})();
+
+function openExportModal(){
+  document.getElementById('exportModal').showModal();
+}
+function closeExportModal(){
+  document.getElementById('exportModal').close();
+}
+(function(){
+  var dlg = document.getElementById('exportModal');
+  if (!dlg) return;
+  dlg.addEventListener('click', function(e){ if (e.target === dlg) closeExportModal(); });
+  document.getElementById('exportForm').addEventListener('submit', function(e){
+    e.preventDefault();
+    var params = new URLSearchParams();
+    var start = document.getElementById('expStart').value;
+    var end = document.getElementById('expEnd').value;
+    var status = document.getElementById('expStatus').value;
+    var origem = document.getElementById('expOrigem').value;
+    var categoria = document.getElementById('expCategoria').value;
+    var format = document.querySelector('input[name="expFormat"]:checked').value;
+    if (start) params.set('start', start);
+    if (end) params.set('end', end);
+    if (status) params.set('status', status);
+    if (origem) params.set('origem', origem);
+    if (categoria) params.set('categoria', categoria);
+    params.set('format', format);
+    window.open('/export/complaints?' + params.toString(), '_blank');
+    closeExportModal();
+  });
+})();
 </script>
 """
 
@@ -1734,6 +2008,76 @@ def render_dashboard(
       </div>
     </div>
   </div>""" if interactive else ""
+
+    rc_action_buttons_html = (
+        '<div class="panel-header-actions">'
+        '<button type="button" class="btn btn-ghost" onclick="openExportModal()">Exportar</button>'
+        '<button type="button" class="btn" onclick="openAddComplaintModal()">Adicionar reclamação</button>'
+        '</div>'
+    ) if interactive else ""
+
+    status_form_opts = "".join(
+        f'<option value="{esc(code)}">{esc(label)}</option>' for code, label in STATUS_LABELS.items()
+    )
+    add_complaint_modal_html = f"""
+<dialog id="addComplaintModal" class="modal">
+  <form class="modal-form" id="addComplaintForm">
+    <p class="panel-title" style="margin-bottom:6px">Adicionar reclamação manual</p>
+    <p class="panel-note">Pra registrar reclamações que não vieram pela API do Reclame Aqui — elas nunca são desativadas automaticamente.</p>
+    <p style="color:var(--coral);font-size:12px;margin:0 0 10px" id="addComplaintError" hidden></p>
+    <label class="modal-field"><span>Título *</span><input type="text" id="addCTitle" maxlength="300" required></label>
+    <div class="modal-field-row">
+      <label class="modal-field"><span>Cidade</span><input type="text" id="addCCity" maxlength="120"></label>
+      <label class="modal-field modal-field--narrow"><span>UF</span><input type="text" id="addCState" maxlength="2"></label>
+    </div>
+    <div class="modal-field-row">
+      <label class="modal-field"><span>Status *</span><select id="addCStatus" required>{status_form_opts}</select></label>
+      <label class="modal-field modal-field--narrow"><span>Data *</span><input type="date" id="addCCreated" required></label>
+    </div>
+    <div class="modal-field-row">
+      <label class="modal-field"><span>Origem</span><select id="addCOrigem"><option value="">Sem tag</option>{origem_filter_opts}</select></label>
+      <label class="modal-field"><span>Motivo</span><select id="addCCategoria"><option value="">Sem motivo</option>{categoria_filter_opts}</select></label>
+    </div>
+    <label class="modal-field"><span>Nota (0–10, opcional — só se já foi avaliada)</span><input type="number" id="addCScore" min="0" max="10" step="0.1"></label>
+    <div class="modal-check-row">
+      <label><input type="checkbox" id="addCSolved"> Resolvida</label>
+      <label><input type="checkbox" id="addCDealAgain"> Voltaria a fazer negócio</label>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeAddComplaintModal()">Cancelar</button>
+      <button type="submit" class="btn" id="addComplaintSubmit">Adicionar</button>
+    </div>
+  </form>
+</dialog>""" if interactive else ""
+
+    export_modal_html = f"""
+<dialog id="exportModal" class="modal">
+  <form class="modal-form" id="exportForm">
+    <p class="panel-title" style="margin-bottom:6px">Exportar reclamações</p>
+    <p class="panel-note">Escolha o período e os filtros, depois o formato.</p>
+    <div class="modal-field-row">
+      <label class="modal-field"><span>De</span><input type="date" id="expStart"></label>
+      <label class="modal-field"><span>Até</span><input type="date" id="expEnd"></label>
+    </div>
+    <label class="modal-field"><span>Status</span><select id="expStatus"><option value="">Todos</option>{status_filter_opts}</select></label>
+    <div class="modal-field-row">
+      <label class="modal-field"><span>Origem</span><select id="expOrigem"><option value="">Todas</option>{origem_filter_opts}</select></label>
+      <label class="modal-field"><span>Motivo</span><select id="expCategoria"><option value="">Todos</option>{categoria_filter_opts}</select></label>
+    </div>
+    <div class="modal-field">
+      <span>Formato</span>
+      <div class="modal-radio-row">
+        <label><input type="radio" name="expFormat" value="pdf" checked> PDF</label>
+        <label><input type="radio" name="expFormat" value="csv"> CSV (Excel)</label>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeExportModal()">Cancelar</button>
+      <button type="submit" class="btn" id="exportSubmit">Exportar</button>
+    </div>
+  </form>
+</dialog>""" if interactive else ""
+
     script = TABS_JS + (SCRIPT_JS if interactive else "")
 
     return f"""<!DOCTYPE html>
@@ -1943,8 +2287,13 @@ def render_dashboard(
   </div>
 
   <div class="panel">
-    <p class="panel-title">Reclamações</p>
-    <p class="panel-note">Todas as ativas{' · clique numa tag pra classificar origem/motivo' if interactive else ''}</p>
+    <div class="panel-header-row">
+      <div>
+        <p class="panel-title">Reclamações</p>
+        <p class="panel-note">Todas as ativas{' · clique numa tag pra classificar origem/motivo' if interactive else ''}</p>
+      </div>
+      {rc_action_buttons_html}
+    </div>
 
     <div class="filter-bar">
       <input type="search" id="rcFilterTitle" placeholder="Buscar por título…" oninput="applyComplaintFilters()">
@@ -1990,6 +2339,8 @@ def render_dashboard(
 
 </div>
 {token_modal_html}
+{add_complaint_modal_html}
+{export_modal_html}
 {script}
 </body>
 </html>

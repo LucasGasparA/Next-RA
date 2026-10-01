@@ -11,7 +11,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, redirect, request, session, url_for
+from flask import Flask, Response, jsonify, redirect, request, session, url_for
 
 import ar_history
 import main
@@ -352,6 +352,56 @@ def api_categorias():
         return jsonify({"ok": True, "categorias": categorias})
     finally:
         conn.close()
+
+
+@app.route("/api/complaints/manual", methods=["POST"])
+def api_complaints_manual():
+    body = request.get_json(silent=True) or {}
+    try:
+        record = main.build_manual_complaint(body)
+    except main.ManualComplaintError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    conn = store.get_connection()
+    try:
+        store.insert_manual_complaint(conn, record)
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@app.route("/export/complaints")
+def export_complaints():
+    fmt = (request.args.get("format") or "pdf").lower()
+    start = (request.args.get("start") or "").strip() or None
+    end = (request.args.get("end") or "").strip() or None
+    status = (request.args.get("status") or "").strip() or None
+    origem = (request.args.get("origem") or "").strip() or None
+    categoria = (request.args.get("categoria") or "").strip() or None
+
+    conn = store.get_connection()
+    try:
+        with main.DB_LOCK:
+            db = store.load_db(conn)
+    finally:
+        conn.close()
+
+    rows = main.filter_complaints_for_export(db, start, end, status, origem, categoria)
+    filename_period = f"{start or 'inicio'}_a_{end or 'fim'}"
+
+    if fmt == "csv":
+        body = main.generate_complaints_csv(rows)
+        return Response(
+            body,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="reclamacoes_{filename_period}.csv"'},
+        )
+
+    body = main.generate_complaints_pdf(rows, start, end)
+    return Response(
+        body,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="reclamacoes_{filename_period}.pdf"'},
+    )
 
 
 if __name__ == "__main__":

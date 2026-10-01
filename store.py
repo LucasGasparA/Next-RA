@@ -261,6 +261,35 @@ def set_categoria(conn: psycopg.Connection, cid: str, categoria: str | None) -> 
     return updated
 
 
+def insert_manual_complaint(conn: psycopg.Connection, record: dict) -> None:
+    """INSERT pontual de uma reclamação criada manualmente (ver
+    main.build_manual_complaint) — não recarrega/reescreve o dict inteiro,
+    mesmo espírito de set_tag/set_categoria."""
+    data = {k: v for k, v in record.items() if k not in RECORD_COLUMNS}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO complaints (id, data, tag_origem, categoria, first_seen, last_seen, deactivated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (
+                record["id"],
+                json.dumps(data, ensure_ascii=False),
+                record.get("tag_origem"),
+                record.get("categoria"),
+                record.get("first_seen"),
+                record.get("last_seen"),
+                record.get("deactivated_at"),
+            ),
+        )
+    conn.commit()
+    if record.get("tag_origem"):
+        add_tag(conn, record["tag_origem"])
+    if record.get("categoria"):
+        add_categoria(conn, record["categoria"])
+
+
 def get_setting(conn: psycopg.Connection, key: str) -> str | None:
     with conn.cursor() as cur:
         cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
