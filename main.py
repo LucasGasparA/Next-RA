@@ -853,6 +853,8 @@ STATUS_LABELS = {
     "FINISHED": "Finalizada",
     "FINISHED_NOT_EVALUATED": "Finalizada (sem avaliação)",
     "IN_TREATMENT": "Em tratamento",
+    "MODERATED": "Moderada",
+    "REMOVED": "Removida",
 }
 STATUS_COLORS = {
     "PENDING": "#FFC93D",
@@ -860,6 +862,8 @@ STATUS_COLORS = {
     "FINISHED": "#3DD68C",
     "FINISHED_NOT_EVALUATED": "#C77DF0",
     "IN_TREATMENT": "#FF8F5C",
+    "MODERATED": "#8B7FA3",
+    "REMOVED": "#FF6B6D",
 }
 
 
