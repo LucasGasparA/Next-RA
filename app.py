@@ -404,5 +404,17 @@ def export_complaints():
     )
 
 
+@app.route("/report/markdown")
+def report_markdown():
+    conn = store.get_connection()
+    try:
+        with main.DB_LOCK:
+            db = store.load_db(conn)
+    finally:
+        conn.close()
+    body = main.generate_coordinator_report_markdown(db)
+    return Response(body, mimetype="text/markdown; charset=utf-8")
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=os.environ.get("FLASK_ENV") == "development")

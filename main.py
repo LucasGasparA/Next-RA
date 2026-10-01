@@ -91,6 +91,12 @@ AR_WINDOW_MONTHS = 6
 # deslocado) — 1 é o valor que reproduz a janela oficial.
 AR_WINDOW_LAG_MONTHS = 1
 
+# Metas do relatório de coordenação (ver generate_coordinator_report_markdown) —
+# fixas por enquanto; mesmos números já usados no relatório manual no Notion.
+REPORT_TARGET_MA = 8.0
+REPORT_TARGET_EVAL_RATE = 80.0
+REPORT_TARGET_IN_PCT = 80.0
+
 # estado global simples (usado pelo servidor local)
 DEMO_MODE = False
 
@@ -827,6 +833,181 @@ def build_dashboard_data(db: dict, now: datetime | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# RELATÓRIO DE COORDENAÇÃO (MARKDOWN) — mesmo formato que o usuário já usa
+# manualmente no Notion, gerado a partir dos mesmos cálculos do dashboard.
+# ---------------------------------------------------------------------------
+def complaints_in_month(db: dict, target_month_key: str) -> list[dict]:
+    return [
+        c for c in db["complaints"].values()
+        if month_key(c.get("created")) == target_month_key and not c.get("deactivated_at")
+    ]
+
+
+def _br_num(v, decimals: int = 2) -> str:
+    if v is None:
+        return "—"
+    return f"{v:.{decimals}f}".replace(".", ",")
+
+
+def _fmt_score_cell(score) -> str:
+    s = f"{score:.1f}".rstrip("0").rstrip(".")
+    return (s or "0").replace(".", ",")
+
+
+def _reputation_range_str(label: str) -> str:
+    for lo, hi, name, _color in REPUTATION_BANDS:
+        if name == label:
+            return f"{label} ({str(lo).replace('.', ',')} a {str(hi).replace('.', ',')})"
+    return label  # "Não Recomendada" / "Sem Reputação Definida" não têm faixa numérica
+
+
+def _report_complaint_rows(complaints: list[dict]) -> str:
+    if not complaints:
+        return "| _(nenhuma reclamação no mês)_ | | |"
+    rows = []
+    for c in sorted(complaints, key=lambda x: x.get("created", "")):
+        if c.get("evaluated") and c.get("score") is not None:
+            nota = _fmt_score_cell(c["score"])
+            resolvida = "Sim" if c.get("solved") else "Não"
+            voltaria = "Sim" if c.get("dealAgain") else "Não"
+        elif (c.get("status") or "") in ("FINISHED", "FINISHED_NOT_EVALUATED"):
+            nota, resolvida, voltaria = "Não avaliada", "—", "—"
+        else:
+            nota, resolvida, voltaria = "Em andamento", "—", "—"
+        rows.append(f"| {nota} | {resolvida} | {voltaria} |")
+    return "\n".join(rows)
+
+
+def generate_coordinator_report_markdown(db: dict, now: datetime | None = None) -> str:
+    """Monta o relatório de coordenação no mesmo formato que o usuário já usa
+    manualmente no Notion — reaproveita compute_monthly_evolution/
+    compute_ar_projection/reputation_label tal qual o dashboard usa, só
+    formatado como markdown. Campos que não existem nos dados do RA (ex:
+    volume de atendimentos de outro sistema) ficam como placeholder
+    "_(preencher)_" pro usuário completar antes de colar no Notion.
+    """
+    now = now or datetime.now()
+    monthly = compute_monthly_evolution(db, now)
+    proj = compute_ar_projection(db, now)
+
+    current = monthly[-1]  # mês em andamento
+    closed = monthly[-2] if len(monthly) >= 2 else monthly[-1]  # último mês fechado
+    outgoing, incoming = monthly[0], monthly[-1]  # mesma dupla do painel "Projeção — virada de mês"
+
+    removed_note = f" ({closed['removed']} desativadas)" if closed["removed"] else ""
+
+    lines: list[str] = []
+    lines.append("## ➡️ Takeaways da reunião anterior\n")
+    lines.append("_(preencher)_\n")
+
+    lines.append("## ➡️ Indicadores do Reclame Aqui\n")
+    lines.append(f"### Resultados de {closed['month_label']}\n")
+    lines.append("| Indicador | Meta | Resultado atual | Considerações |")
+    lines.append("| --- | --- | --- | --- |")
+    lines.append(
+        f"| Reclamações no período | N/A | {closed['active']}{removed_note} | "
+        f"**Volume de atendimentos mês anterior:** _(preencher)_  "
+        f"**Volume de atendimentos mês atual:** _(preencher)_ |"
+    )
+    lines.append(f"| Nota do consumidor | {_br_num(REPORT_TARGET_MA, 1)} | {_br_num(closed['ma'], 2)} | _(preencher)_ |")
+    lines.append(f"| Avaliações recebidas | {_br_num(REPORT_TARGET_EVAL_RATE, 0)}% | {_br_num(closed['eval_rate'], 2)}% | _(preencher)_ |")
+    lines.append(f"| Voltaria a fazer negócio? | {_br_num(REPORT_TARGET_IN_PCT, 0)}% | {_br_num(closed['in_pct'], 2)}% | |")
+    lines.append(f"| SLA médio de resposta | N/A | {closed['sla_manual'] or '_(preencher)_'} | |")
+    lines.append("")
+
+    lines.append(f"**Origem da reclamação ({closed['month_label']} → {current['month_label']}):**\n")
+    origin_keys = (set(closed["origin_counts"]) | set(current["origin_counts"])) - {"Sem tag"}
+    ordered = sorted(
+        origin_keys,
+        key=lambda k: -(closed["origin_counts"].get(k, 0) + current["origin_counts"].get(k, 0)),
+    )
+    if ordered:
+        for name in ordered:
+            lines.append(f"- {name}: {closed['origin_counts'].get(name, 0)} → {current['origin_counts'].get(name, 0)}")
+    else:
+        lines.append("_(nenhuma origem marcada)_")
+    lines.append("")
+
+    lines.append("### Evolução mensal\n")
+    lines.append("| Indicador | " + " | ".join(m["month_label"] for m in monthly) + " |")
+    lines.append("| --- " * (len(monthly) + 1) + "|")
+
+    def _row(label: str, values: list[str]) -> str:
+        return f"| {label} | " + " | ".join(values) + " |"
+
+    lines.append(_row("Reclamações no período", [
+        f"{m['active']}" + (f" ({m['removed']} desativadas)" if m["removed"] else "") for m in monthly
+    ]))
+    lines.append(_row("Nota do consumidor", [_br_num(m["ma"], 2) for m in monthly]))
+    lines.append(_row("Avaliações recebidas", [
+        (_br_num(m["eval_rate"], 2) + "%") if m["eval_rate"] is not None else "—" for m in monthly
+    ]))
+    lines.append(_row("Índice de solução", [
+        (_br_num(m["is_pct"], 2) + "%") if m["is_pct"] is not None else "—" for m in monthly
+    ]))
+    lines.append(_row("Voltaria a fazer negócio?", [
+        (_br_num(m["in_pct"], 2) + "%") if m["in_pct"] is not None else "—" for m in monthly
+    ]))
+    lines.append(_row("SLA médio de resposta", [m["sla_manual"] or "_(preencher)_" for m in monthly]))
+    lines.append("")
+
+    lines.append("### Projeção de nota após a virada\n")
+    lines.append(f"**Nota AR (virada de janela: {outgoing['month_label']} sai, {incoming['month_label']} entra):**\n")
+
+    lines.append(f"**{outgoing['month_label']} (sai da contagem):**\n")
+    lines.append("| Nota | Resolvida? | Voltaria a fazer negócio? |")
+    lines.append("| --- | --- | --- |")
+    lines.append(_report_complaint_rows(complaints_in_month(db, outgoing["month_key"])))
+    lines.append("")
+
+    lines.append(f"**{incoming['month_label']} (entra na contagem)** — {incoming['active']} reclamações\n")
+    lines.append("| Nota | Resolvida? | Voltaria a fazer negócio? |")
+    lines.append("| --- | --- | --- |")
+    lines.append(_report_complaint_rows(complaints_in_month(db, incoming["month_key"])))
+    lines.append("")
+
+    # soma de notas da janela de projeção (6 meses terminando no mês corrente)
+    # — não vem pronta em stats_for_group (só a média), então recalcula aqui
+    # em cima do mesmo recorte de meses que compute_ar_projection usa.
+    proj_keys = {mk(y, m) for (y, m) in trailing_months(now.year, now.month, AR_WINDOW_MONTHS)}
+    score_sum = sum(
+        c["score"] for c in db["complaints"].values()
+        if month_key(c.get("created")) in proj_keys and not c.get("deactivated_at")
+        and c.get("evaluated") and c.get("score") is not None
+    )
+
+    lines.append(
+        f"**Cálculo da nota AR (base: {proj['total']} reclamações {proj['window_start']}-{proj['window_end']}, "
+        f"já com {incoming['month_label']} dentro e {outgoing['month_label']} fora):**\n"
+    )
+    lines.append("| Indicador | Resultado | Como foi calculado |")
+    lines.append("| --- | --- | --- |")
+    lines.append(f"| IR (Índice de Resposta) | {_br_num(proj['ir'], 2)}% | {proj['answered']} de {proj['total']} respondidas |")
+    lines.append(f"| MA (Nota Média do Consumidor) | {_br_num(proj['ma'], 2)} | soma de {_br_num(score_sum, 0)} pontos ÷ {proj['n_evaluated']} avaliações |")
+    lines.append(f"| IS (Índice de Solução) | {_br_num(proj['is_pct'], 2)}% | {proj['solved']} resolvidas ÷ {proj['n_evaluated']} finalizadas |")
+    lines.append(f"| IN (Voltaria a fazer negócio) | {_br_num(proj['in_pct'], 2)}% | {proj['deal_yes']} ÷ {proj['n_evaluated']} |")
+    lines.append(
+        f"| **AR final** | {_br_num(proj['ar'], 2)} | "
+        f"(({_br_num(proj['ir'], 2)}×2) + ({_br_num(proj['ma'], 2)}×10×3) + "
+        f"({_br_num(proj['is_pct'], 2)}×3) + ({_br_num(proj['in_pct'], 2)}×2)) ÷ 100 |"
+    )
+    lines.append("")
+    lines.append(f"### ***Faixa de reputação: {_reputation_range_str(proj['label'])}***\n")
+
+    lines.append("## ➡️ Pontos para discussão\n")
+    lines.append("_(preencher)_\n")
+    lines.append("| Data | Link | De: | Responsável | Origem? | Reclamação | Situação |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| | | | | | | |")
+    lines.append("")
+
+    lines.append("## ➡️ Takeaways do dia\n")
+    lines.append("- [ ] ")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # RENDER HTML
 # ---------------------------------------------------------------------------
 def score_color(score):
@@ -1188,6 +1369,13 @@ CSS = """
   .modal-field--narrow { flex: 0 0 90px !important; }
   .modal-check-row, .modal-radio-row { display: flex; gap: 16px; font-size: 12.5px; color: var(--ink-soft); margin: 0 0 14px; }
   .modal-check-row label, .modal-radio-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+  dialog.modal--wide { width: min(760px, 94vw); }
+  .report-output {
+    width: 100%; min-height: 50vh; resize: vertical; box-sizing: border-box; border: 1px solid var(--border-strong);
+    border-radius: 10px; background: var(--canvas); color: var(--ink); padding: 12px; margin: 10px 0 16px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; font-size: 12px; line-height: 1.5;
+  }
 """
 
 TABS_JS = """
@@ -1683,6 +1871,45 @@ function closeExportModal(){
     closeExportModal();
   });
 })();
+
+async function openReportModal(){
+  var dlg = document.getElementById('reportModal');
+  var out = document.getElementById('reportModalOutput');
+  var errEl = document.getElementById('reportModalError');
+  errEl.hidden = true;
+  out.value = '';
+  out.placeholder = 'Carregando...';
+  dlg.showModal();
+  try {
+    const r = await fetch('/report/markdown');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    out.value = await r.text();
+  } catch (e) {
+    errEl.textContent = 'Erro ao gerar relatório: ' + e;
+    errEl.hidden = false;
+  }
+}
+function closeReportModal(){
+  document.getElementById('reportModal').close();
+}
+async function copyReportMarkdown(){
+  var out = document.getElementById('reportModalOutput');
+  var btn = document.getElementById('reportModalCopy');
+  try {
+    await navigator.clipboard.writeText(out.value);
+    btn.textContent = 'Copiado!';
+  } catch (e) {
+    out.select();
+    document.execCommand('copy');
+    btn.textContent = 'Copiado!';
+  }
+  setTimeout(function(){ btn.textContent = 'Copiar'; }, 1800);
+}
+(function(){
+  var dlg = document.getElementById('reportModal');
+  if (!dlg) return;
+  dlg.addEventListener('click', function(e){ if (e.target === dlg) closeReportModal(); });
+})();
 </script>
 """
 
@@ -1990,6 +2217,23 @@ def render_dashboard(
         '<button id="refreshBtn" class="btn btn-refresh" onclick="refreshData()">Atualizar agora</button>'
         if interactive else ""
     )
+    report_button_html = (
+        '<button type="button" class="kebab-item" onclick="openReportModal()">Gerar relatório</button>'
+        if interactive else ""
+    )
+    report_modal_html = """
+<dialog id="reportModal" class="modal modal--wide">
+  <div class="modal-form">
+    <p class="panel-title" style="margin-bottom:6px">Relatório de coordenação</p>
+    <p class="panel-note">Markdown pronto pra colar no Notion — campos sem dado no RA ficam com <code>_(preencher)_</code>.</p>
+    <p style="color:var(--coral);font-size:12px;margin:0 0 10px" id="reportModalError" hidden></p>
+    <textarea id="reportModalOutput" class="report-output" readonly placeholder="Carregando..."></textarea>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-ghost" onclick="closeReportModal()">Fechar</button>
+      <button type="button" class="btn" id="reportModalCopy" onclick="copyReportMarkdown()">Copiar</button>
+    </div>
+  </div>
+</dialog>""" if interactive else ""
     token_modal_html = TOKEN_MODAL_HTML if interactive else ""
     manage_tags_html = f"""
   <div class="panel">
@@ -2122,6 +2366,7 @@ def render_dashboard(
         <div class="kebab-brand"><span class="wordmark"><span class="dot"></span>Next RA</span></div>
         <button type="button" class="kebab-item" onclick="toggleTheme()"><span id="themeToggleLabel">Mudar para tema claro</span></button>
         {refresh_button}
+        {report_button_html}
         <div class="kebab-links">{extra_header_html}</div>
       </div>
     </div>
@@ -2345,6 +2590,7 @@ def render_dashboard(
 {token_modal_html}
 {add_complaint_modal_html}
 {export_modal_html}
+{report_modal_html}
 {script}
 </body>
 </html>
